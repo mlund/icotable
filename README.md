@@ -13,8 +13,10 @@ The crate provides:
 
 - **`Table6D`** &mdash; nested periodic table over (R, &omega;) with `IcoTable4D` angular layers,
   used during table construction.
-- **`Table6DFlat<T>`** &mdash; flat, bincode-serializable representation for fast runtime lookup.
+- **`Table6DFlat<T>`** &mdash; flat, bincode-serializable 6D representation for fast runtime lookup.
   Supports optional gzip compression (`.gz` suffix).
+- **`Table3DFlat<T>`** &mdash; flat, bincode-serializable 3D table (R, &theta;, &phi;) for
+  rigid body + single atom interactions. Same serialization and icosphere interpolation as the 6D variant.
 - **`orient` / `inverse_orient`** &mdash; forward and inverse coordinate transforms between
   6D table indices and quaternion + separation-vector representation.
 - **`IcoTable2D<T>`** &mdash; single-icosphere angular table with barycentric interpolation,
@@ -27,9 +29,10 @@ The crate provides:
 This crate is a shared dependency between:
 
 - [**Duello**](https://github.com/mlund/duello) &mdash; computes 6D energy tables by scanning
-  all orientations of two rigid molecules (`Table6D` &rarr; `Table6DFlat::save()`).
+  all orientations of two rigid molecules (`Table6D` &rarr; `Table6DFlat::save()`),
+  and 3D tables for rigid body + single atom interactions (`atom-scan` &rarr; `Table3DFlat::save()`).
 - [**Faunus**](https://github.com/mlund/faunus-rs) &mdash; loads pre-computed tables for
-  O(1) energy lookups during rigid-body Monte Carlo simulations (`Table6DFlat::load()`).
+  O(1) energy lookups during Monte Carlo simulations (`Table6DFlat::load()`, `Table3DFlat::load()`).
 
 ## License
 

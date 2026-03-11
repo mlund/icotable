@@ -34,6 +34,15 @@ impl<T: Clone + GetSize> PaddedTable<T> {
             .map(move |(i, value)| ((i as f64).mul_add(res, min), value))
     }
 
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (f64, &mut T)> {
+        let min = self.min;
+        let res = self.res;
+        self.data
+            .iter_mut()
+            .enumerate()
+            .map(move |(i, value)| ((i as f64).mul_add(res, min), value))
+    }
+
     pub fn min_key(&self) -> f64 {
         self.min + self.res
     }

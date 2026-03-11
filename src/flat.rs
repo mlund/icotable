@@ -1,14 +1,115 @@
-//! Portable, flat representation of a 6D table for file I/O and fast lookup.
+//! Portable, flat representations of angular tables for file I/O and fast lookup.
 //!
-//! [`Table6DFlat`] stores all data in contiguous vectors (no nested Arc/OnceLock)
-//! for efficient serialization with bincode and simple interpolation at runtime.
+//! [`Table6DFlat`] and [`Table3DFlat`] store all data in contiguous vectors
+//! (no nested Arc/OnceLock) for efficient serialization with bincode and
+//! simple interpolation at runtime.
 
-use crate::icotable::{Face, IcoTable4D, Table6D};
+use crate::icotable::{Face, IcoTable2D, IcoTable4D, Table6D};
+use crate::table::PaddedTable;
 use crate::Vector3;
 use anyhow::Result;
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-use serde::{Deserialize, Serialize};
+use get_size::GetSize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::path::Path;
+
+/// Save a bincode-serializable value. A `.gz` suffix enables gzip compression.
+fn save_bincode(value: &impl Serialize, path: &Path) -> Result<()> {
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    if path.extension().is_some_and(|ext| ext == "gz") {
+        bincode::serialize_into(GzEncoder::new(file, Compression::default()), value)?;
+    } else {
+        bincode::serialize_into(file, value)?;
+    }
+    Ok(())
+}
+
+/// Load a bincode-deserializable value. A `.gz` suffix enables gzip decompression.
+fn load_bincode<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let file = std::io::BufReader::new(std::fs::File::open(path)?);
+    Ok(if path.extension().is_some_and(|ext| ext == "gz") {
+        bincode::deserialize_from(GzDecoder::new(file))?
+    } else {
+        bincode::deserialize_from(file)?
+    })
+}
+
+/// Find the mesh face containing `dir` and return barycentric coordinates.
+///
+/// Searches all triangles incident on the nearest vertex (formed by pairs of
+/// mutual neighbors) for one where all barycentric coordinates are non-negative.
+fn find_face_bary(
+    dir: &Vector3,
+    vertices: &[[f64; 3]],
+    neighbors: &[Vec<u16>],
+) -> (Face, [f64; 3]) {
+    let dir = dir.normalize();
+
+    let nearest = vertices
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i, (dir - Vector3::from(*v)).norm_squared()))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("vertices must not be empty")
+        .0;
+
+    let nbrs = &neighbors[nearest];
+
+    // Search all neighbor pairs that share an edge (= actual mesh triangle).
+    // Picking the two closest neighbors would often select non-adjacent vertices,
+    // yielding a spurious triangle and poor interpolation.
+    let mut best_face = [0usize; 3];
+    let mut best_min_bary = f64::NEG_INFINITY;
+
+    for (idx_i, &ni) in nbrs.iter().enumerate() {
+        let ni = ni as usize;
+        for &nj in &nbrs[idx_i + 1..] {
+            let nj = nj as usize;
+            if !neighbors[ni].contains(&(nj as u16)) {
+                continue;
+            }
+            let face = [nearest, ni, nj];
+            let bary = projected_barycentric(
+                &dir,
+                &vertex_vec3(vertices, face[0]),
+                &vertex_vec3(vertices, face[1]),
+                &vertex_vec3(vertices, face[2]),
+            );
+            let min_b = bary[0].min(bary[1]).min(bary[2]);
+            if min_b > best_min_bary {
+                best_min_bary = min_b;
+                best_face = face;
+            }
+        }
+    }
+
+    // Recompute barycentric coords for the sorted face (index order matters for lookup)
+    best_face.sort_unstable();
+    let best_bary = projected_barycentric(
+        &dir,
+        &vertex_vec3(vertices, best_face[0]),
+        &vertex_vec3(vertices, best_face[1]),
+        &vertex_vec3(vertices, best_face[2]),
+    );
+
+    (best_face, best_bary)
+}
+
+fn vertex_vec3(vertices: &[[f64; 3]], i: usize) -> Vector3 {
+    Vector3::from(vertices[i])
+}
+
+/// Extract normalized vertex positions and neighbor lists from an `IcoTable2D`.
+fn extract_mesh<T: Clone + GetSize>(
+    ico: &IcoTable2D<T>,
+) -> (Vec<[f64; 3]>, Vec<Vec<u16>>) {
+    let vertices = ico
+        .iter_positions()
+        .map(|p| <[f64; 3]>::from(p.normalize()))
+        .collect();
+    let neighbors = ico.iter_vertices().map(|v| v.neighbors.clone()).collect();
+    (vertices, neighbors)
+}
 
 /// Flat, serializable 6D lookup table.
 ///
@@ -30,30 +131,12 @@ pub struct Table6DFlat<T: num_traits::Float> {
     pub data: Vec<T>,
 }
 
-impl<T: num_traits::Float + Serialize + serde::de::DeserializeOwned> Table6DFlat<T> {
-    /// Save to a bincode file. A `.gz` suffix enables gzip compression.
+impl<T: num_traits::Float + Serialize + DeserializeOwned> Table6DFlat<T> {
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-        if path.extension().is_some_and(|ext| ext == "gz") {
-            let encoder = GzEncoder::new(file, Compression::default());
-            bincode::serialize_into(encoder, self)?;
-        } else {
-            bincode::serialize_into(file, self)?;
-        }
-        Ok(())
+        save_bincode(self, path.as_ref())
     }
-
-    /// Load from a bincode file. A `.gz` suffix enables gzip decompression.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let file = std::io::BufReader::new(std::fs::File::open(path)?);
-        let table: Self = if path.extension().is_some_and(|ext| ext == "gz") {
-            bincode::deserialize_from(GzDecoder::new(file))?
-        } else {
-            bincode::deserialize_from(file)?
-        };
-        Ok(table)
+        load_bincode(path.as_ref())
     }
 }
 
@@ -75,20 +158,7 @@ impl TryFrom<&Table6D> for Table6DFlat<f32> {
 
         let first_ico = first_omega_table.get(omega_min)?;
         let n_vertices = first_ico.len();
-
-        // Collect normalized vertex positions and neighbors
-        let vertices: Vec<[f64; 3]> = first_ico
-            .iter_positions()
-            .map(|p| {
-                let n = p.normalize();
-                [n.x, n.y, n.z]
-            })
-            .collect();
-
-        let neighbors: Vec<Vec<u16>> = first_ico
-            .iter_vertices()
-            .map(|v| v.neighbors.clone())
-            .collect();
+        let (vertices, neighbors) = extract_mesh(first_ico);
 
         let stride = n_omega * n_vertices * n_vertices;
         let mut data = vec![0.0f32; n_r * stride];
@@ -134,9 +204,8 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
         let omega = omega.rem_euclid(std::f64::consts::TAU);
         let oi = (omega / self.omega_step + 0.5) as usize % self.n_omega;
 
-        // Find nearest faces and barycentric coords for both directions
-        let (face_a, bary_a) = self.find_face_bary(dir_a);
-        let (face_b, bary_b) = self.find_face_bary(dir_b);
+        let (face_a, bary_a) = find_face_bary(dir_a, &self.vertices, &self.neighbors);
+        let (face_b, bary_b) = find_face_bary(dir_b, &self.vertices, &self.neighbors);
 
         // Bilinear barycentric: bary_a^T * M * bary_b
         let base = ri * self.n_omega * self.n_vertices * self.n_vertices
@@ -151,70 +220,6 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
             }
         }
         result
-    }
-
-    /// Find the mesh face containing `dir` and return barycentric coordinates.
-    ///
-    /// Searches all triangles incident on the nearest vertex (formed by pairs of
-    /// mutual neighbors) for one where all barycentric coordinates are non-negative.
-    fn find_face_bary(&self, dir: &Vector3) -> (Face, [f64; 3]) {
-        let dir = dir.normalize();
-
-        // Brute-force nearest vertex
-        let nearest = self
-            .vertices
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let d = (dir.x - v[0]).powi(2) + (dir.y - v[1]).powi(2) + (dir.z - v[2]).powi(2);
-                (i, d)
-            })
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .expect("vertices must not be empty")
-            .0;
-
-        let nbrs = &self.neighbors[nearest];
-
-        // Search all neighbor pairs that share an edge (= actual mesh triangle).
-        // Picking the two closest neighbors would often select non-adjacent vertices,
-        // yielding a spurious triangle and poor interpolation.
-        let mut best_face = [0usize; 3];
-        let mut best_min_bary = f64::NEG_INFINITY;
-
-        for (idx_i, &ni) in nbrs.iter().enumerate() {
-            let ni = ni as usize;
-            for &nj in &nbrs[idx_i + 1..] {
-                let nj = nj as usize;
-                // Only consider neighbor pairs that share an edge (valid mesh triangle)
-                if !self.neighbors[ni].contains(&(nj as u16)) {
-                    continue;
-                }
-                let face = [nearest, ni, nj];
-                let a = self.vertex_vec3(face[0]);
-                let b = self.vertex_vec3(face[1]);
-                let c = self.vertex_vec3(face[2]);
-                let bary = projected_barycentric(&dir, &a, &b, &c);
-                let min_b = bary[0].min(bary[1]).min(bary[2]);
-                if min_b > best_min_bary {
-                    best_min_bary = min_b;
-                    best_face = face;
-                }
-            }
-        }
-
-        // Recompute barycentric coords for the sorted face (index order matters for lookup)
-        best_face.sort_unstable();
-        let a = self.vertex_vec3(best_face[0]);
-        let b = self.vertex_vec3(best_face[1]);
-        let c = self.vertex_vec3(best_face[2]);
-        let best_bary = projected_barycentric(&dir, &a, &b, &c);
-
-        (best_face, best_bary)
-    }
-
-    fn vertex_vec3(&self, i: usize) -> Vector3 {
-        let v = &self.vertices[i];
-        Vector3::new(v[0], v[1], v[2])
     }
 }
 
@@ -283,24 +288,103 @@ fn flat_iter_indexed(ico4d: &IcoTable4D, n_vertices: usize) -> Vec<(usize, usize
     result
 }
 
+/// Flat, serializable 3D lookup table for rigid body + single atom interactions.
+///
+/// Layout: `data[r_idx * n_vertices + vi]`
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Table3DFlat<T: num_traits::Float> {
+    pub rmin: f64,
+    pub rmax: f64,
+    pub dr: f64,
+    pub n_r: usize,
+    pub n_vertices: usize,
+    /// Normalized unit-sphere vertex positions `[x, y, z]`.
+    pub vertices: Vec<[f64; 3]>,
+    /// Neighbor indices per vertex.
+    pub neighbors: Vec<Vec<u16>>,
+    /// Flat data array.
+    pub data: Vec<T>,
+}
+
+impl<T: num_traits::Float + Serialize + DeserializeOwned> Table3DFlat<T> {
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        save_bincode(self, path.as_ref())
+    }
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        load_bincode(path.as_ref())
+    }
+}
+
+impl TryFrom<&PaddedTable<IcoTable2D<f64>>> for Table3DFlat<f32> {
+    type Error = anyhow::Error;
+
+    fn try_from(table: &PaddedTable<IcoTable2D<f64>>) -> Result<Self> {
+        let r_min = table.min_key();
+        let r_max = table.max_key();
+        let dr = table.key_step();
+        let n_r = table.len() - 2;
+
+        let first_ico = table.get(r_min)?;
+        let n_vertices = first_ico.len();
+        let (vertices, neighbors) = extract_mesh(first_ico);
+
+        let mut data = vec![0.0f32; n_r * n_vertices];
+
+        for ri in 0..n_r {
+            let r = r_min + ri as f64 * dr;
+            let ico = table.get(r)?;
+            for (vi, val) in ico.vertex_data().enumerate() {
+                data[ri * n_vertices + vi] = *val as f32;
+            }
+        }
+
+        Ok(Self {
+            rmin: r_min,
+            rmax: r_max,
+            dr,
+            n_r,
+            n_vertices,
+            vertices,
+            neighbors,
+            data,
+        })
+    }
+}
+
+impl<T: num_traits::Float + Into<f64>> Table3DFlat<T> {
+    /// Lookup energy by nearest R bin and barycentric interpolation on icosphere.
+    pub fn lookup(&self, r: f64, direction: &Vector3) -> f64 {
+        if r < self.rmin || r > self.rmax {
+            return 0.0;
+        }
+        let ri = ((r - self.rmin) / self.dr + 0.5) as usize;
+        let ri = ri.min(self.n_r.saturating_sub(1));
+
+        let (face, bary) = find_face_bary(direction, &self.vertices, &self.neighbors);
+        let base = ri * self.n_vertices;
+
+        let mut result = 0.0;
+        for i in 0..3 {
+            let val: f64 = self.data[base + face[i]].into();
+            result += bary[i] * val;
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn make_test_mesh(min_points: usize) -> (usize, Vec<[f64; 3]>, Vec<Vec<u16>>) {
+        let ico = IcoTable2D::<f64>::from_min_points(min_points).unwrap();
+        let (vertices, neighbors) = extract_mesh(&ico);
+        (ico.len(), vertices, neighbors)
+    }
+
     /// Build a small table from a real icosphere for lookup testing.
     fn make_test_table(min_points: usize, n_r: usize, n_omega: usize) -> Table6DFlat<f32> {
-        use crate::{make_icosphere, make_vertices};
-        let ico = make_icosphere(min_points).unwrap();
-        let verts = make_vertices(&ico);
-        let n_v = verts.len();
-        let vertices: Vec<[f64; 3]> = verts
-            .iter()
-            .map(|v| {
-                let p = v.pos.normalize();
-                [p.x, p.y, p.z]
-            })
-            .collect();
-        let neighbors: Vec<Vec<u16>> = verts.iter().map(|v| v.neighbors.clone()).collect();
+        let (n_v, vertices, neighbors) = make_test_mesh(min_points);
         let rmin = 5.0;
         let dr = 1.0;
         let rmax = rmin + (n_r as f64) * dr;
@@ -346,20 +430,9 @@ mod tests {
 
     #[test]
     fn lookup_at_vertex_exact() {
-        use crate::{make_icosphere, make_vertices};
-        let ico = make_icosphere(1).unwrap();
-        let verts = make_vertices(&ico);
-        let n_v = verts.len();
+        let (n_v, vertices, neighbors) = make_test_mesh(1);
         let n_r = 3;
         let n_omega = 4;
-        let vertices: Vec<[f64; 3]> = verts
-            .iter()
-            .map(|v| {
-                let p = v.pos.normalize();
-                [p.x, p.y, p.z]
-            })
-            .collect();
-        let neighbors: Vec<Vec<u16>> = verts.iter().map(|v| v.neighbors.clone()).collect();
 
         // Set data[vi, vj] = (vi + vj) as f32 for r_idx=1, omega_idx=0
         let mut data = vec![0.0f32; n_r * n_omega * n_v * n_v];
@@ -405,19 +478,7 @@ mod tests {
 
     /// Build a table filled with `analytic_fn` at each vertex pair.
     fn make_analytic_table(min_points: usize) -> Table6DFlat<f32> {
-        use crate::{make_icosphere, make_vertices};
-        let ico = make_icosphere(min_points).unwrap();
-        let verts = make_vertices(&ico);
-        let n_v = verts.len();
-        let vertices: Vec<[f64; 3]> = verts
-            .iter()
-            .map(|v| {
-                let p = v.pos.normalize();
-                [p.x, p.y, p.z]
-            })
-            .collect();
-        let neighbors: Vec<Vec<u16>> = verts.iter().map(|v| v.neighbors.clone()).collect();
-
+        let (n_v, vertices, neighbors) = make_test_mesh(min_points);
         let n_r = 3;
         let n_omega = 4;
         let rmin = 5.0;
@@ -524,5 +585,54 @@ mod tests {
         let raw_size = std::fs::metadata(&path).unwrap().len();
         let gz_size = std::fs::metadata(&gz_path).unwrap().len();
         assert!(gz_size < raw_size);
+    }
+
+    fn make_test_table_3d(min_points: usize, n_r: usize) -> Table3DFlat<f32> {
+        let (n_v, vertices, neighbors) = make_test_mesh(min_points);
+        let rmin = 5.0;
+        let dr = 1.0;
+        let rmax = rmin + (n_r as f64) * dr;
+        let data = vec![42.0f32; n_r * n_v];
+        Table3DFlat {
+            rmin,
+            rmax,
+            dr,
+            n_r,
+            n_vertices: n_v,
+            vertices,
+            neighbors,
+            data,
+        }
+    }
+
+    #[test]
+    fn table3d_lookup_constant() {
+        let table = make_test_table_3d(1, 5);
+        let dir = Vector3::new(1.0, 0.0, 0.0);
+        let e = table.lookup(7.0, &dir);
+        assert!((e - 42.0).abs() < 1e-4, "Expected ~42, got {}", e);
+        let dir2 = Vector3::new(1.0, 1.0, 1.0).normalize();
+        let e2 = table.lookup(6.5, &dir2);
+        assert!((e2 - 42.0).abs() < 1e-4, "Expected ~42, got {}", e2);
+    }
+
+    #[test]
+    fn table3d_out_of_range_returns_zero() {
+        let table = make_test_table_3d(1, 5);
+        let dir = Vector3::new(1.0, 0.0, 0.0);
+        assert_eq!(table.lookup(3.0, &dir), 0.0);
+        assert_eq!(table.lookup(20.0, &dir), 0.0);
+    }
+
+    #[test]
+    fn table3d_round_trip_save_load() {
+        let table = make_test_table_3d(1, 5);
+        let dir = tempfile::tempdir().unwrap();
+
+        let gz_path = dir.path().join("test3d.bin.gz");
+        table.save(&gz_path).unwrap();
+        let loaded = Table3DFlat::<f32>::load(&gz_path).unwrap();
+        assert_eq!(loaded.n_vertices, table.n_vertices);
+        assert_eq!(loaded.data, table.data);
     }
 }
