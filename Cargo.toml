@@ -1,0 +1,29 @@
+[package]
+name = "icotable"
+version = "0.1.0"
+edition = "2021"
+description = "Icosphere-based 6D angular lookup tables for rigid molecule-molecule interactions"
+authors = ["Mikael Lund <lyssky@icloud.com>"]
+repository = "https://github.com/mlund/icotable"
+readme = "README.md"
+license = "Apache-2.0"
+categories = ["science"]
+keywords = ["icosphere", "angular_lookup", "molecular_interactions", "barycentric"]
+
+[dependencies]
+anyhow = "1.0"
+nalgebra = "0.34.1"
+hexasphere = { version = "16.0", features = ["adjacency"] }
+itertools = "0.14"
+get-size = { version = "0.1", features = ["derive"], default-features = false }
+num-traits = "0.2"
+serde = { version = "1.0", features = ["derive"], default-features = false }
+bincode = "1.3"
+flate2 = "1.0"
+log = "0.4"
+glam = "0.30"
+
+[dev-dependencies]
+approx = "0.5"
+rand = "0.8"
+tempfile = "3"
