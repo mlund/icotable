@@ -200,26 +200,35 @@ impl TryFrom<&Table6D> for Table6DFlat<f32> {
 }
 
 impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
-    /// Lookup value by nearest R/ω bin and barycentric interpolation on icospheres.
-    pub fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3) -> f64 {
+    /// Resolve R/ω bins and icosphere faces for a given query point.
+    fn resolve_bins(
+        &self,
+        r: f64,
+        omega: f64,
+        dir_a: &Vector3,
+        dir_b: &Vector3,
+    ) -> Option<(usize, Face, [f64; 3], Face, [f64; 3])> {
         if r < self.rmin || r > self.rmax {
-            return 0.0;
+            return None;
         }
-
         let ri = ((r - self.rmin) / self.dr + 0.5) as usize;
         let ri = ri.min(self.n_r.saturating_sub(1));
-
-        // Wrap omega into [0, 2π)
         let omega = omega.rem_euclid(std::f64::consts::TAU);
         let oi = (omega / self.omega_step + 0.5) as usize % self.n_omega;
-
-        let (face_a, bary_a) = find_face_bary(dir_a, &self.vertices, &self.neighbors);
-        let (face_b, bary_b) = find_face_bary(dir_b, &self.vertices, &self.neighbors);
-
-        // Bilinear barycentric: bary_a^T * M * bary_b
         let base = ri * self.n_omega * self.n_vertices * self.n_vertices
             + oi * self.n_vertices * self.n_vertices;
+        let (face_a, bary_a) = find_face_bary(dir_a, &self.vertices, &self.neighbors);
+        let (face_b, bary_b) = find_face_bary(dir_b, &self.vertices, &self.neighbors);
+        Some((base, face_a, bary_a, face_b, bary_b))
+    }
 
+    /// Lookup value by nearest R/ω bin and barycentric interpolation on icospheres.
+    pub fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3) -> f64 {
+        let (base, face_a, bary_a, face_b, bary_b) =
+            match self.resolve_bins(r, omega, dir_a, dir_b) {
+                Some(v) => v,
+                None => return 0.0,
+            };
         let mut result = 0.0;
         for i in 0..3 {
             for j in 0..3 {
@@ -229,6 +238,57 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
             }
         }
         result
+    }
+
+    /// Boltzmann-weighted interpolation: interpolate exp(-beta*u) then invert.
+    ///
+    /// Linear interpolation of a convex energy surface overestimates (Jensen's
+    /// inequality). By interpolating the Boltzmann factor instead, we avoid
+    /// this systematic bias at repulsive contacts. `beta` must be positive.
+    pub fn lookup_boltzmann(
+        &self,
+        r: f64,
+        omega: f64,
+        dir_a: &Vector3,
+        dir_b: &Vector3,
+        beta: f64,
+    ) -> f64 {
+        debug_assert!(beta > 0.0, "beta must be positive, got {beta}");
+        let (base, face_a, bary_a, face_b, bary_b) =
+            match self.resolve_bins(r, omega, dir_a, dir_b) {
+                Some(v) => v,
+                None => return 0.0,
+            };
+
+        // Shift by u_min before exp() to prevent fp overflow (log-sum-exp trick);
+        // the final `+ u_min` restores the correct result.
+        let mut vals = [0.0f64; 9];
+        let mut u_min = f64::INFINITY;
+        for i in 0..3 {
+            for j in 0..3 {
+                let idx = base + face_a[i] * self.n_vertices + face_b[j];
+                let val: f64 = self.data[idx].into();
+                vals[i * 3 + j] = val;
+                if val < u_min {
+                    u_min = val;
+                }
+            }
+        }
+        if u_min.is_infinite() {
+            return f64::INFINITY;
+        }
+
+        let mut sum = 0.0;
+        for i in 0..3 {
+            for j in 0..3 {
+                sum += bary_a[i] * bary_b[j] * (-beta * (vals[i * 3 + j] - u_min)).exp();
+            }
+        }
+
+        if sum <= 0.0 {
+            return f64::INFINITY;
+        }
+        u_min - sum.ln() / beta
     }
 }
 
@@ -437,6 +497,35 @@ mod tests {
     }
 
     #[test]
+    fn boltzmann_lookup_constant_table() {
+        let table = make_test_table(1, 5, 8);
+        let dir_a = Vector3::new(1.0, 0.0, 0.0);
+        let dir_b = Vector3::new(0.0, 1.0, 0.0);
+        // Constant table: Boltzmann lookup should also return ~42 for any beta
+        let e = table.lookup_boltzmann(7.0, 1.0, &dir_a, &dir_b, 1.0);
+        assert!((e - 42.0).abs() < 1e-4, "Expected ~42, got {}", e);
+        let e2 = table.lookup_boltzmann(7.0, 1.0, &dir_a, &dir_b, 0.5);
+        assert!((e2 - 42.0).abs() < 1e-4, "Expected ~42, got {}", e2);
+    }
+
+    #[test]
+    fn boltzmann_vs_linear_convex() {
+        // For a convex function, Boltzmann interpolation should give
+        // lower (less biased) values than linear interpolation.
+        let table = make_table_with_fn(1, |va, vb| 10.0 * (va - vb).norm());
+
+        // Off-vertex direction: Boltzmann should be <= linear for convex data
+        let dir_a = Vector3::new(1.0, 1.0, 1.0).normalize();
+        let dir_b = Vector3::new(-1.0, 0.5, 0.3).normalize();
+        let linear = table.lookup(6.0, 0.0, &dir_a, &dir_b);
+        let boltz = table.lookup_boltzmann(6.0, 0.0, &dir_a, &dir_b, 1.0);
+        assert!(
+            boltz <= linear + 1e-10,
+            "Boltzmann ({boltz:.4}) should be <= linear ({linear:.4}) for convex function"
+        );
+    }
+
+    #[test]
     fn lookup_out_of_range_returns_zero() {
         let table = make_test_table(1, 5, 8);
         let dir = Vector3::new(1.0, 0.0, 0.0);
@@ -474,11 +563,7 @@ mod tests {
         };
 
         // Query exactly at vertex 0 direction for both → should get 0+0=0
-        let dir0 = Vector3::new(
-            table.vertices[0][0],
-            table.vertices[0][1],
-            table.vertices[0][2],
-        );
+        let dir0 = Vector3::from(table.vertices[0]);
         let e = table.lookup(6.0, 0.0, &dir0, &dir0);
         assert!(e.abs() < 1.0, "Expected ~0 at vertex (0,0), got {}", e);
     }
@@ -492,8 +577,11 @@ mod tests {
         da * da + db * db
     }
 
-    /// Build a table filled with `analytic_fn` at each vertex pair.
-    fn make_analytic_table(min_points: usize) -> Table6DFlat<f32> {
+    /// Build a table where each vertex pair is filled by `f(dir_a, dir_b)`.
+    fn make_table_with_fn(
+        min_points: usize,
+        f: impl Fn(&Vector3, &Vector3) -> f64,
+    ) -> Table6DFlat<f32> {
         let (n_v, vertices, neighbors) = make_test_mesh(min_points);
         let n_r = 3;
         let n_omega = 4;
@@ -507,11 +595,11 @@ mod tests {
         for ri in 0..n_r {
             for oi in 0..n_omega {
                 for vi in 0..n_v {
-                    let va = Vector3::new(vertices[vi][0], vertices[vi][1], vertices[vi][2]);
+                    let va = Vector3::from(vertices[vi]);
                     for vj in 0..n_v {
-                        let vb = Vector3::new(vertices[vj][0], vertices[vj][1], vertices[vj][2]);
+                        let vb = Vector3::from(vertices[vj]);
                         let idx = ri * stride + oi * n_v * n_v + vi * n_v + vj;
-                        data[idx] = analytic_fn(&va, &vb) as f32;
+                        data[idx] = f(&va, &vb) as f32;
                     }
                 }
             }
@@ -528,6 +616,61 @@ mod tests {
             vertices,
             neighbors,
             data,
+        }
+    }
+
+    fn make_analytic_table(min_points: usize) -> Table6DFlat<f32> {
+        make_table_with_fn(min_points, analytic_fn)
+    }
+
+    /// Test that orient → inverse_orient → lookup recovers the correct table value
+    /// for exact vertex orientations with arbitrary initial quaternions.
+    #[test]
+    fn lookup_via_orient_inverse_roundtrip() {
+        use crate::orient::{inverse_orient, orient};
+        use rand::Rng;
+
+        let table = make_analytic_table(42); // match resolution used in production
+        let mut rng = rand::thread_rng();
+        let r = 6.0; // within table range
+
+        for vi in 0..table.n_vertices.min(10) {
+            for vj in 0..table.n_vertices.min(10) {
+                let va = Vector3::from(table.vertices[vi]);
+                let vb = Vector3::from(table.vertices[vj]);
+
+                for _ in 0..5 {
+                    let omega = rng.gen_range(0.0..std::f64::consts::TAU);
+
+                    // Forward: get quaternions and separation for this pose
+                    let (q_a, q_b, sep) = orient(r, omega, &va, &vb);
+
+                    // Now simulate what Faunus does: apply an arbitrary rotation
+                    // to both molecules (as if they were rotated during placement)
+                    let random_q = nalgebra::UnitQuaternion::from_euler_angles(
+                        rng.gen_range(0.0..std::f64::consts::TAU),
+                        rng.gen_range(0.0..std::f64::consts::PI),
+                        rng.gen_range(0.0..std::f64::consts::TAU),
+                    );
+                    let q_a_rot = random_q * q_a;
+                    let q_b_rot = random_q * q_b;
+                    let sep_rot = random_q.transform_vector(&sep);
+
+                    // Inverse: recover 6D coordinates
+                    let (r2, omega2, dir_a2, dir_b2) = inverse_orient(&sep_rot, &q_a_rot, &q_b_rot);
+
+                    // Lookup should give the same value as the exact vertex value
+                    let looked_up = table.lookup(r2, omega2, &dir_a2, &dir_b2);
+                    let exact = analytic_fn(&va, &vb);
+
+                    // On-vertex queries should be near-exact (only f32 rounding)
+                    assert!(
+                        (looked_up - exact).abs() < 0.05,
+                        "vi={vi}, vj={vj}: looked_up={looked_up:.4}, exact={exact:.4}, \
+                         dir_a={dir_a2:?}, dir_b={dir_b2:?}, omega={omega2:.4}"
+                    );
+                }
+            }
         }
     }
 
