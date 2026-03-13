@@ -18,6 +18,8 @@ mod vertex;
 
 // Public API
 pub use flat::{Table3DFlat, Table6DFlat};
+/// Half-precision float for compact table storage.
+pub use half::f16;
 pub use icosphere::make_icosphere_vertices;
 pub use ico::{Face, IcoTable2D, IcoTable4D, Table6D};
 pub use orient::{inverse_orient, orient};

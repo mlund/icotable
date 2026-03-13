@@ -2,15 +2,18 @@
 //!
 //! [`Table6DFlat`] and [`Table3DFlat`] store all data in contiguous vectors
 //! (no nested Arc/OnceLock) for efficient serialization with bincode and
-//! simple interpolation at runtime.
+//! simple interpolation at runtime. Both are generic over `f32` and
+//! [`half::f16`] for half-precision storage. Vertices are BFS-reordered
+//! during construction to improve cache locality.
 
-use crate::ico::{Face, IcoTable2D, IcoTable4D, Table6D};
+use crate::ico::{Face, IcoTable2D, Table6D};
 use crate::table::PaddedTable;
 use crate::Vector3;
 use anyhow::Result;
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use get_size::GetSize;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -272,54 +275,75 @@ impl<T: num_traits::Float + Serialize + DeserializeOwned> Table6DFlat<T> {
     }
 }
 
-impl TryFrom<&Table6D> for Table6DFlat<f32> {
-    type Error = anyhow::Error;
+/// Build a flat 6D table with element type `T`, converting each f64 value via `convert`.
+fn build_flat_6d<T: num_traits::Float + Copy>(
+    table: &Table6D,
+    convert: impl Fn(f64) -> T,
+) -> Result<Table6DFlat<T>> {
+    let r_min = table.min_key();
+    let r_max = table.max_key();
+    let dr = table.key_step();
+    let n_r = table.len() - 2;
 
-    fn try_from(table: &Table6D) -> Result<Self> {
-        let r_min = table.min_key();
-        let r_max = table.max_key();
-        let dr = table.key_step();
-        // Interior bins (excluding PaddedTable's boundary padding)
-        let n_r = table.len() - 2;
+    let first_omega_table = table.get(r_min)?;
+    let omega_step = first_omega_table.key_step();
+    let omega_min = first_omega_table.min_key();
+    let n_omega = first_omega_table.len() - 2;
 
-        // Extract vertex/omega info from first (r, omega=0) entry
-        let first_omega_table = table.get(r_min)?;
-        let omega_step = first_omega_table.key_step();
-        let omega_min = first_omega_table.min_key();
-        let n_omega = first_omega_table.len() - 2;
+    let first_ico = first_omega_table.get(omega_min)?;
+    let n_vertices = first_ico.len();
+    let (mut vertices, mut neighbors) = extract_mesh(first_ico);
 
-        let first_ico = first_omega_table.get(omega_min)?;
-        let n_vertices = first_ico.len();
-        let (vertices, neighbors) = extract_mesh(first_ico);
+    let stride = n_omega * n_vertices * n_vertices;
+    let zero = convert(0.0);
+    let mut data = vec![zero; n_r * stride];
 
-        let stride = n_omega * n_vertices * n_vertices;
-        let mut data = vec![0.0f32; n_r * stride];
-
-        for ri in 0..n_r {
-            let r = (ri as f64).mul_add(dr, r_min);
-            for oi in 0..n_omega {
-                let omega = (oi as f64).mul_add(omega_step, omega_min);
-                let ico4d = table.get_icospheres(r, omega)?;
-                for (vi, vj, value) in flat_iter_indexed(ico4d, n_vertices) {
-                    let idx = ri * stride + oi * (n_vertices * n_vertices) + vi * n_vertices + vj;
-                    data[idx] = *value as f32;
+    for ri in 0..n_r {
+        let r = (ri as f64).mul_add(dr, r_min);
+        for oi in 0..n_omega {
+            let omega = (oi as f64).mul_add(omega_step, omega_min);
+            let ico4d = table.get_icospheres(r, omega)?;
+            let base = ri * stride + oi * (n_vertices * n_vertices);
+            for vi in 0..n_vertices {
+                let inner = ico4d.get_data(vi).expect("missing 4D table entry");
+                for vj in 0..n_vertices {
+                    if let Some(val) = inner.get_data(vj) {
+                        data[base + vi * n_vertices + vj] = convert(*val);
+                    }
                 }
             }
         }
+    }
 
-        Ok(Self {
-            rmin: r_min,
-            rmax: r_max,
-            dr,
-            n_r,
-            omega_step,
-            n_omega,
-            n_vertices,
-            vertices,
-            neighbors,
-            data,
-            locator: OnceLock::new(),
-        })
+    let perm = bfs_vertex_permutation(&neighbors);
+    apply_vertex_permutation(&perm, &mut vertices, &mut neighbors, &mut data, n_vertices, n_vertices);
+
+    Ok(Table6DFlat {
+        rmin: r_min,
+        rmax: r_max,
+        dr,
+        n_r,
+        omega_step,
+        n_omega,
+        n_vertices,
+        vertices,
+        neighbors,
+        data,
+        locator: OnceLock::new(),
+    })
+}
+
+impl TryFrom<&Table6D> for Table6DFlat<f32> {
+    type Error = anyhow::Error;
+    fn try_from(table: &Table6D) -> Result<Self> {
+        build_flat_6d(table, |v| v as f32)
+    }
+}
+
+impl TryFrom<&Table6D> for Table6DFlat<half::f16> {
+    type Error = anyhow::Error;
+    fn try_from(table: &Table6D) -> Result<Self> {
+        build_flat_6d(table, half::f16::from_f64)
     }
 }
 
@@ -417,6 +441,110 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
     }
 }
 
+/// BFS traversal from vertex 0, returning a permutation `old_index → new_index`.
+fn bfs_vertex_permutation(neighbors: &[Vec<u16>]) -> Vec<usize> {
+    let n = neighbors.len();
+    let mut new_of_old = vec![usize::MAX; n];
+    let mut queue = VecDeque::with_capacity(n);
+    let mut next_id = 0;
+
+    new_of_old[0] = 0;
+    next_id += 1;
+    queue.push_back(0usize);
+
+    while let Some(old) = queue.pop_front() {
+        for &nb in &neighbors[old] {
+            let nb = nb as usize;
+            if new_of_old[nb] == usize::MAX {
+                new_of_old[nb] = next_id;
+                next_id += 1;
+                queue.push_back(nb);
+            }
+        }
+    }
+    debug_assert!(
+        new_of_old.iter().all(|&p| p != usize::MAX),
+        "disconnected vertex graph: not all vertices reachable from vertex 0"
+    );
+    new_of_old
+}
+
+/// Reorder vertices, neighbors, and data in-place according to a vertex permutation.
+///
+/// `entries_per_vertex` is 1 for 3D tables or `n_v` for 6D tables (where each
+/// slab has `n_v * n_v` entries indexed by two vertex indices).
+fn apply_vertex_permutation<T: Copy>(
+    perm: &[usize],
+    vertices: &mut [[f64; 3]],
+    neighbors: &mut [Vec<u16>],
+    data: &mut [T],
+    n_v: usize,
+    entries_per_vertex: usize,
+) {
+    debug_assert_eq!(perm.len(), n_v);
+
+    // Inverse permutation: old_of_new[new] = old
+    let mut old_of_new = vec![0usize; n_v];
+    for (old, &new) in perm.iter().enumerate() {
+        old_of_new[new] = old;
+    }
+
+    // In-place cycle-following for vertices
+    let mut done = vec![false; n_v];
+    for start in 0..n_v {
+        if done[start] || old_of_new[start] == start {
+            done[start] = true;
+            continue;
+        }
+        let mut cur = start;
+        let tmp_v = vertices[start];
+        let tmp_n = std::mem::take(&mut neighbors[start]);
+        loop {
+            let src = old_of_new[cur];
+            if src == start {
+                vertices[cur] = tmp_v;
+                neighbors[cur] = tmp_n;
+                done[cur] = true;
+                break;
+            }
+            vertices[cur] = vertices[src];
+            neighbors[cur] = std::mem::take(&mut neighbors[src]);
+            done[cur] = true;
+            cur = src;
+        }
+    }
+
+    // Remap neighbor indices to new IDs
+    for nbrs in neighbors.iter_mut() {
+        for nb in nbrs.iter_mut() {
+            *nb = perm[*nb as usize] as u16;
+        }
+    }
+
+    // Reorder data slabs — requires a clone since 6D rows are interleaved
+    let slab_size = entries_per_vertex * n_v;
+    let n_slabs = data.len() / slab_size;
+    let old_data = data.to_vec();
+    if entries_per_vertex == n_v {
+        for s in 0..n_slabs {
+            let base = s * slab_size;
+            for ni in 0..n_v {
+                let oi = old_of_new[ni];
+                for nj in 0..n_v {
+                    data[base + ni * n_v + nj] = old_data[base + oi * n_v + old_of_new[nj]];
+                }
+            }
+        }
+    } else {
+        for s in 0..n_slabs {
+            let base = s * n_v;
+            for ni in 0..n_v {
+                data[base + ni] = old_data[base + old_of_new[ni]];
+            }
+        }
+    }
+}
+
 /// Projected barycentric coordinates (Ericson, "Real-Time Collision Detection", p141-142).
 ///
 /// Single free function shared by both `Table6DFlat::find_face_bary` and
@@ -468,20 +596,6 @@ pub(crate) fn projected_barycentric(
     [1.0 - v - w, v, w]
 }
 
-/// Indexed flat iterator yielding `(vi, vj, &f64)` for ordered vertex pairs.
-fn flat_iter_indexed(ico4d: &IcoTable4D, n_vertices: usize) -> Vec<(usize, usize, &f64)> {
-    let mut result = Vec::with_capacity(n_vertices * n_vertices);
-    for vi in 0..n_vertices {
-        let inner = ico4d.get_data(vi).expect("missing 4D table entry");
-        for vj in 0..n_vertices {
-            if let Some(val) = inner.get_data(vj) {
-                result.push((vi, vj, val));
-            }
-        }
-    }
-    result
-}
-
 /// Flat, serializable 3D lookup table for rigid body + single atom interactions.
 ///
 /// Layout: `data[r_idx * n_vertices + vi]`
@@ -519,40 +633,58 @@ impl<T: num_traits::Float + Serialize + DeserializeOwned> Table3DFlat<T> {
     }
 }
 
+/// Build a flat 3D table with element type `T`, converting each f64 value via `convert`.
+fn build_flat_3d<T: num_traits::Float + Copy>(
+    table: &PaddedTable<IcoTable2D<f64>>,
+    convert: impl Fn(f64) -> T,
+) -> Result<Table3DFlat<T>> {
+    let r_min = table.min_key();
+    let r_max = table.max_key();
+    let dr = table.key_step();
+    let n_r = table.len() - 2;
+
+    let first_ico = table.get(r_min)?;
+    let n_vertices = first_ico.len();
+    let (mut vertices, mut neighbors) = extract_mesh(first_ico);
+
+    let zero = convert(0.0);
+    let mut data = vec![zero; n_r * n_vertices];
+
+    for ri in 0..n_r {
+        let r = (ri as f64).mul_add(dr, r_min);
+        let ico = table.get(r)?;
+        for (vi, val) in ico.vertex_data().enumerate() {
+            data[ri * n_vertices + vi] = convert(*val);
+        }
+    }
+
+    let perm = bfs_vertex_permutation(&neighbors);
+    apply_vertex_permutation(&perm, &mut vertices, &mut neighbors, &mut data, n_vertices, 1);
+
+    Ok(Table3DFlat {
+        rmin: r_min,
+        rmax: r_max,
+        dr,
+        n_r,
+        n_vertices,
+        vertices,
+        neighbors,
+        data,
+        locator: OnceLock::new(),
+    })
+}
+
 impl TryFrom<&PaddedTable<IcoTable2D<f64>>> for Table3DFlat<f32> {
     type Error = anyhow::Error;
-
     fn try_from(table: &PaddedTable<IcoTable2D<f64>>) -> Result<Self> {
-        let r_min = table.min_key();
-        let r_max = table.max_key();
-        let dr = table.key_step();
-        let n_r = table.len() - 2;
+        build_flat_3d(table, |v| v as f32)
+    }
+}
 
-        let first_ico = table.get(r_min)?;
-        let n_vertices = first_ico.len();
-        let (vertices, neighbors) = extract_mesh(first_ico);
-
-        let mut data = vec![0.0f32; n_r * n_vertices];
-
-        for ri in 0..n_r {
-            let r = (ri as f64).mul_add(dr, r_min);
-            let ico = table.get(r)?;
-            for (vi, val) in ico.vertex_data().enumerate() {
-                data[ri * n_vertices + vi] = *val as f32;
-            }
-        }
-
-        Ok(Self {
-            rmin: r_min,
-            rmax: r_max,
-            dr,
-            n_r,
-            n_vertices,
-            vertices,
-            neighbors,
-            data,
-            locator: OnceLock::new(),
-        })
+impl TryFrom<&PaddedTable<IcoTable2D<f64>>> for Table3DFlat<half::f16> {
+    type Error = anyhow::Error;
+    fn try_from(table: &PaddedTable<IcoTable2D<f64>>) -> Result<Self> {
+        build_flat_3d(table, half::f16::from_f64)
     }
 }
 
@@ -928,6 +1060,157 @@ mod tests {
         let loaded = Table3DFlat::<f32>::load(&gz_path).unwrap();
         assert_eq!(loaded.n_vertices, table.n_vertices);
         assert_eq!(loaded.data, table.data);
+    }
+
+    #[test]
+    fn f16_round_trip_save_load() {
+        use half::f16;
+        let table = Table6DFlat::<f16> {
+            rmin: 5.0,
+            rmax: 10.0,
+            dr: 1.0,
+            n_r: 5,
+            omega_step: 0.5,
+            n_omega: 4,
+            n_vertices: 3,
+            vertices: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            neighbors: vec![vec![1, 2], vec![0, 2], vec![0, 1]],
+            data: vec![f16::from_f64(1.0); 5 * 4 * 3 * 3],
+            locator: OnceLock::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_f16.bin.gz");
+        table.save(&path).unwrap();
+        let loaded = Table6DFlat::<f16>::load(&path).unwrap();
+        assert_eq!(loaded.n_vertices, 3);
+        assert_eq!(loaded.data, table.data);
+    }
+
+    #[test]
+    fn f16_lookup_constant_table() {
+        use half::f16;
+        let (n_v, vertices, neighbors) = make_test_mesh(1);
+        let n_r = 5;
+        let n_omega = 8;
+        let rmin = 5.0;
+        let dr = 1.0;
+        let rmax = rmin + (n_r as f64) * dr;
+        let omega_step = std::f64::consts::TAU / n_omega as f64;
+        let data = vec![f16::from_f64(42.0); n_r * n_omega * n_v * n_v];
+        let table = Table6DFlat {
+            rmin,
+            rmax,
+            dr,
+            n_r,
+            omega_step,
+            n_omega,
+            n_vertices: n_v,
+            vertices,
+            neighbors,
+            data,
+            locator: OnceLock::new(),
+        };
+        let dir_a = Vector3::new(1.0, 0.0, 0.0);
+        let dir_b = Vector3::new(0.0, 1.0, 0.0);
+        let e = table.lookup(7.0, 1.0, &dir_a, &dir_b);
+        assert!((e - 42.0).abs() < 0.1, "Expected ~42, got {e}");
+    }
+
+    #[test]
+    fn bfs_permutation_is_bijection() {
+        let (_, _, neighbors) = make_test_mesh(42);
+        let perm = bfs_vertex_permutation(&neighbors);
+        let n = neighbors.len();
+        assert_eq!(perm.len(), n);
+        let mut seen = vec![false; n];
+        for &new_id in &perm {
+            assert!(new_id < n, "out of range: {new_id}");
+            assert!(!seen[new_id], "duplicate: {new_id}");
+            seen[new_id] = true;
+        }
+    }
+
+    #[test]
+    fn reordered_lookup_matches_original() {
+        // Build a table with non-trivial per-vertex data, then reorder and compare lookups
+        let (n_v, vertices, neighbors) = make_test_mesh(42);
+        let n_r = 3;
+        let n_omega = 4;
+        let rmin = 5.0;
+        let dr = 1.0;
+        let rmax = rmin + n_r as f64 * dr;
+        let omega_step = std::f64::consts::TAU / n_omega as f64;
+        let stride = n_omega * n_v * n_v;
+
+        // Fill with f(vi,vj) = vi*n_v + vj
+        let mut data = vec![0.0f32; n_r * stride];
+        for s in 0..n_r * n_omega {
+            for vi in 0..n_v {
+                for vj in 0..n_v {
+                    data[s * n_v * n_v + vi * n_v + vj] = (vi * n_v + vj) as f32;
+                }
+            }
+        }
+
+        let orig = Table6DFlat {
+            rmin,
+            rmax,
+            dr,
+            n_r,
+            omega_step,
+            n_omega,
+            n_vertices: n_v,
+            vertices: vertices.clone(),
+            neighbors: neighbors.clone(),
+            data: data.clone(),
+            locator: OnceLock::new(),
+        };
+
+        // Apply BFS reordering
+        let perm = bfs_vertex_permutation(&neighbors);
+        let mut rv = vertices.clone();
+        let mut rn = neighbors.clone();
+        let mut rd = data.clone();
+        apply_vertex_permutation(&perm, &mut rv, &mut rn, &mut rd, n_v, n_v);
+
+        let reordered = Table6DFlat {
+            rmin,
+            rmax,
+            dr,
+            n_r,
+            omega_step,
+            n_omega,
+            n_vertices: n_v,
+            vertices: rv,
+            neighbors: rn,
+            data: rd,
+            locator: OnceLock::new(),
+        };
+
+        // Lookups at random directions should match
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for _ in 0..200 {
+            let random_dir = |rng: &mut rand::rngs::ThreadRng| loop {
+                let x: f64 = rng.gen_range(-1.0..1.0);
+                let y: f64 = rng.gen_range(-1.0..1.0);
+                let z: f64 = rng.gen_range(-1.0..1.0);
+                let r2 = x * x + y * y + z * z;
+                if r2 > 0.01 && r2 < 1.0 {
+                    return Vector3::new(x, y, z).normalize();
+                }
+            };
+            let da = random_dir(&mut rng);
+            let db = random_dir(&mut rng);
+            let r = rng.gen_range(rmin..rmax);
+            let omega = rng.gen_range(0.0..std::f64::consts::TAU);
+            let e_orig = orig.lookup(r, omega, &da, &db);
+            let e_reord = reordered.lookup(r, omega, &da, &db);
+            assert!(
+                (e_orig - e_reord).abs() < 1e-4,
+                "Mismatch: orig={e_orig}, reordered={e_reord}"
+            );
+        }
     }
 
     /// Verify that `VertexLocator` produces identical results to the O(V) reference.

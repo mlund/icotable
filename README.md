@@ -14,9 +14,11 @@ The crate provides:
 - **`Table6D`** &mdash; nested periodic table over (R, &omega;) with `IcoTable4D` angular layers,
   used during table construction.
 - **`Table6DFlat<T>`** &mdash; flat, bincode-serializable 6D representation for fast runtime lookup.
+  Generic over `f32` or `f16` (half-precision via [`half`](https://crates.io/crates/half)).
+  BFS vertex reordering improves cache locality during interpolation.
   Supports optional gzip compression (`.gz` suffix).
 - **`Table3DFlat<T>`** &mdash; flat, bincode-serializable 3D table (R, &theta;, &phi;) for
-  rigid body + single atom interactions. Same serialization and icosphere interpolation as the 6D variant.
+  rigid body + single atom interactions. Same serialization, BFS reordering, and `f32`/`f16` support as the 6D variant.
 - **`orient` / `inverse_orient`** &mdash; forward and inverse coordinate transforms between
   6D table indices and quaternion + separation-vector representation.
 - **`IcoTable2D<T>`** &mdash; single-icosphere angular table with barycentric interpolation,
