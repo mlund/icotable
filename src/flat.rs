@@ -173,9 +173,9 @@ impl TryFrom<&Table6D> for Table6DFlat<f32> {
         let mut data = vec![0.0f32; n_r * stride];
 
         for ri in 0..n_r {
-            let r = r_min + ri as f64 * dr;
+            let r = (ri as f64).mul_add(dr, r_min);
             for oi in 0..n_omega {
-                let omega = omega_min + oi as f64 * omega_step;
+                let omega = (oi as f64).mul_add(omega_step, omega_min);
                 let ico4d = table.get_icospheres(r, omega)?;
                 for (vi, vj, energy) in flat_iter_indexed(ico4d, n_vertices) {
                     let idx = ri * stride + oi * (n_vertices * n_vertices) + vi * n_vertices + vj;
@@ -347,7 +347,7 @@ impl TryFrom<&PaddedTable<IcoTable2D<f64>>> for Table3DFlat<f32> {
         let mut data = vec![0.0f32; n_r * n_vertices];
 
         for ri in 0..n_r {
-            let r = r_min + ri as f64 * dr;
+            let r = (ri as f64).mul_add(dr, r_min);
             let ico = table.get(r)?;
             for (vi, val) in ico.vertex_data().enumerate() {
                 data[ri * n_vertices + vi] = *val as f32;
