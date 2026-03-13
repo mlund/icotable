@@ -10,6 +10,7 @@ pub struct SphericalCoord {
 }
 
 impl SphericalCoord {
+    /// Radial distance.
     pub const fn radius(&self) -> f64 {
         self.r
     }
@@ -21,11 +22,13 @@ impl SphericalCoord {
     pub const fn phi(&self) -> f64 {
         self.phi
     }
+    /// Create from `(r, θ, φ)`.
     pub const fn new(r: f64, theta: f64, phi: f64) -> Self {
         let phi = (phi + 2.0 * PI) % (2.0 * PI);
         let theta = (theta + PI) % PI;
         Self { r, theta, phi }
     }
+    /// Convert from Cartesian coordinates.
     pub fn from_cartesian(cartesian: Vector3) -> Self {
         let r = cartesian.norm();
         let theta = (cartesian.z / r).acos();
@@ -33,6 +36,7 @@ impl SphericalCoord {
         let phi = 2.0f64.mul_add(PI, phi) % (2.0 * PI);
         Self::new(r, theta, phi)
     }
+    /// Convert to Cartesian coordinates.
     pub fn to_cartesian(&self) -> Vector3 {
         let (theta_sin, theta_cos) = self.theta.sin_cos();
         let (phi_sin, phi_cos) = self.phi.sin_cos();

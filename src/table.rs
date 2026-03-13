@@ -1,9 +1,6 @@
 use anyhow::{ensure, Result};
 use get_size::GetSize;
 
-pub type PaddedTable1D = PaddedTable<f64>;
-pub type PaddedTable2D = PaddedTable<PaddedTable1D>;
-
 /// Periodic, equidistant table that emulates periodicity by padding edges.
 #[derive(Debug, Clone, GetSize)]
 pub struct PaddedTable<T: Clone + GetSize> {
@@ -14,6 +11,7 @@ pub struct PaddedTable<T: Clone + GetSize> {
 }
 
 impl<T: Clone + GetSize> PaddedTable<T> {
+    /// Create a new table spanning `[min, max]` with given step size and initial value.
     pub fn new(min: f64, max: f64, step: f64, initial_value: T) -> Self {
         assert!(min < max && step > 0.0);
         let n = (2.0f64.mul_add(step, max - min) / step + 0.5) as usize;
@@ -25,6 +23,7 @@ impl<T: Clone + GetSize> PaddedTable<T> {
         }
     }
 
+    /// Iterate over `(key, value)` pairs.
     pub fn iter(&self) -> impl Iterator<Item = (f64, &T)> {
         let min = self.min;
         let res = self.res;
@@ -34,6 +33,7 @@ impl<T: Clone + GetSize> PaddedTable<T> {
             .map(move |(i, value)| ((i as f64).mul_add(res, min), value))
     }
 
+    /// Iterate over `(key, &mut value)` pairs.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (f64, &mut T)> {
         let min = self.min;
         let res = self.res;
@@ -43,18 +43,22 @@ impl<T: Clone + GetSize> PaddedTable<T> {
             .map(move |(i, value)| ((i as f64).mul_add(res, min), value))
     }
 
+    /// Smallest non-padded key.
     pub fn min_key(&self) -> f64 {
         self.min + self.res
     }
 
+    /// Largest non-padded key.
     pub const fn max_key(&self) -> f64 {
         self.max - self.res
     }
 
+    /// Step size between keys.
     pub const fn key_step(&self) -> f64 {
         self.res
     }
 
+    /// Convert a key to its nearest bin index.
     pub fn to_index(&self, key: f64) -> Result<usize> {
         let index = ((key - self.min) / self.res + 0.5) as usize;
         ensure!(index < self.data.len(), "Index out of range");
@@ -78,19 +82,23 @@ impl<T: Clone + GetSize> PaddedTable<T> {
         Ok(())
     }
 
+    /// Get a reference to the value at `key`.
     pub fn get(&self, key: f64) -> Result<&T> {
         let index = self.to_index(key)?;
         Ok(&self.data[index])
     }
 
+    /// Get a mutable reference to the value at `key`.
     pub fn get_mut(&mut self, key: f64) -> Result<&mut T> {
         let index = self.to_index(key)?;
         Ok(&mut self.data[index])
     }
 
+    /// Total number of entries (including padding).
     pub const fn len(&self) -> usize {
         self.data.len()
     }
+    /// Returns `true` if the table has no entries.
     pub const fn is_empty(&self) -> bool {
         self.data.is_empty()
     }

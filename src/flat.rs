@@ -116,12 +116,19 @@ fn extract_mesh<T: Clone + GetSize>(
 /// Layout: `data[r_idx * (n_omega * n_v * n_v) + omega_idx * (n_v * n_v) + vi * n_v + vj]`
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Table6DFlat<T: num_traits::Float> {
+    /// Minimum radial distance.
     pub rmin: f64,
+    /// Maximum radial distance.
     pub rmax: f64,
+    /// Radial bin width.
     pub dr: f64,
+    /// Number of radial bins.
     pub n_r: usize,
+    /// Dihedral angle bin width (radians).
     pub omega_step: f64,
+    /// Number of dihedral angle bins.
     pub n_omega: usize,
+    /// Number of icosphere vertices.
     pub n_vertices: usize,
     /// Normalized unit-sphere vertex positions `[x, y, z]`.
     pub vertices: Vec<[f64; 3]>,
@@ -132,9 +139,11 @@ pub struct Table6DFlat<T: num_traits::Float> {
 }
 
 impl<T: num_traits::Float + Serialize + DeserializeOwned> Table6DFlat<T> {
+    /// Save to a bincode file (gzip-compressed if path ends in `.gz`).
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         save_bincode(self, path.as_ref())
     }
+    /// Load from a bincode file (gzip-decompressed if path ends in `.gz`).
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         load_bincode(path.as_ref())
     }
@@ -293,10 +302,15 @@ fn flat_iter_indexed(ico4d: &IcoTable4D, n_vertices: usize) -> Vec<(usize, usize
 /// Layout: `data[r_idx * n_vertices + vi]`
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Table3DFlat<T: num_traits::Float> {
+    /// Minimum radial distance.
     pub rmin: f64,
+    /// Maximum radial distance.
     pub rmax: f64,
+    /// Radial bin width.
     pub dr: f64,
+    /// Number of radial bins.
     pub n_r: usize,
+    /// Number of icosphere vertices.
     pub n_vertices: usize,
     /// Normalized unit-sphere vertex positions `[x, y, z]`.
     pub vertices: Vec<[f64; 3]>,
@@ -307,9 +321,11 @@ pub struct Table3DFlat<T: num_traits::Float> {
 }
 
 impl<T: num_traits::Float + Serialize + DeserializeOwned> Table3DFlat<T> {
+    /// Save to a bincode file (gzip-compressed if path ends in `.gz`).
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         save_bincode(self, path.as_ref())
     }
+    /// Load from a bincode file (gzip-decompressed if path ends in `.gz`).
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         load_bincode(path.as_ref())
     }

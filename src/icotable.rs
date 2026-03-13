@@ -37,15 +37,19 @@ fn oncelock_size_helper<T: GetSize>(value: &Vec<OnceLock<T>>) -> usize {
 }
 
 impl<T: Clone + GetSize> IcoTable2D<T> {
-    pub fn iter_vertices(&self) -> impl Iterator<Item = &Vertex> {
+    /// Iterate over all vertices.
+    pub(crate) fn iter_vertices(&self) -> impl Iterator<Item = &Vertex> {
         self.vertices.iter()
     }
+    /// Normalized position of vertex at `index`.
     pub fn get_normalized_pos(&self, index: usize) -> Vector3 {
         self.vertices[index].pos.normalize()
     }
+    /// Data stored at vertex `index`, if set.
     pub fn get_data(&self, index: usize) -> Option<&T> {
         self.data[index].get()
     }
+    /// Neighbor indices for vertex at `index`.
     pub fn get_neighbors(&self, index: usize) -> &[u16] {
         &self.vertices[index].neighbors
     }
@@ -56,9 +60,11 @@ impl<T: Clone + GetSize> IcoTable2D<T> {
             &self.data[index],
         )
     }
+    /// Iterate over vertex positions.
     pub fn iter_positions(&self) -> impl Iterator<Item = &Vector3> {
         self.iter_vertices().map(|v| &v.pos)
     }
+    /// Iterate over `(position, data)` pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&Vector3, Option<&T>)> {
         self.vertices
             .iter()
@@ -70,7 +76,8 @@ impl<T: Clone + GetSize> IcoTable2D<T> {
         (0..self.data.len()).map(move |i| self.get_with_lock(i))
     }
 
-    pub fn from_vertices(vertices: Arc<Vec<Vertex>>, data: Option<T>) -> Self {
+    /// Create from shared vertices, optionally pre-filling all cells with `data`.
+    pub(crate) fn from_vertices(vertices: Arc<Vec<Vertex>>, data: Option<T>) -> Self {
         let num_vertices = vertices.len();
         let data = data.map(OnceLock::from);
         Self {
@@ -86,7 +93,9 @@ impl<T: Clone + GetSize> IcoTable2D<T> {
         }
     }
 
-    pub fn from_icosphere(icosphere: &IcoSphere, default_data: T) -> Self {
+    /// Create from an icosphere, filling all vertices with `default_data`.
+    #[cfg(test)]
+    pub(crate) fn from_icosphere(icosphere: &IcoSphere, default_data: T) -> Self {
         let table = Self::from_icosphere_without_data(icosphere);
         table.set_vertex_data(|_, _| default_data.clone()).unwrap();
         table
@@ -97,10 +106,12 @@ impl<T: Clone + GetSize> IcoTable2D<T> {
         (4.0 * PI / self.data.len() as f64).sqrt()
     }
 
+    /// Number of vertices.
     pub fn len(&self) -> usize {
         self.vertices.len()
     }
 
+    /// Returns `true` if there are no vertices.
     pub fn is_empty(&self) -> bool {
         self.vertices.is_empty()
     }
@@ -120,16 +131,19 @@ impl<T: Clone + GetSize> IcoTable2D<T> {
             })
     }
 
+    /// Reset all vertex data to unset.
     pub fn clear_vertex_data(&mut self) {
         for data in self.data.iter_mut() {
             *data = OnceLock::default();
         }
     }
 
+    /// Iterate over set vertex data values (panics if any vertex is unset).
     pub fn vertex_data(&self) -> impl Iterator<Item = &T> {
         self.data.iter().map(|v| v.get().unwrap())
     }
 
+    /// Apply a transform to all vertex positions.
     pub fn transform_vertex_positions(&mut self, f: impl Fn(&Vector3) -> Vector3) {
         let new_vertices = self
             .iter_vertices()
@@ -166,6 +180,7 @@ impl<T: Clone + GetSize> IcoTable2D<T> {
         Vector3::new(1.0 - v - w, v, w)
     }
 
+    /// Normalized positions of the three vertices of a face.
     pub fn face_positions(&self, face: &Face) -> (Vector3, Vector3, Vector3) {
         (
             self.get_normalized_pos(face[0]),
@@ -243,7 +258,9 @@ impl IcoTable4D {
         })
     }
 
-    pub fn from_min_points(min_points: usize, default_data: IcoTable2D<f64>) -> Result<Self> {
+    /// Create a 4D table with at least `min_points` vertices, filled with `default_data`.
+    #[cfg(test)]
+    pub(crate) fn from_min_points(min_points: usize, default_data: IcoTable2D<f64>) -> Result<Self> {
         let icosphere = make_icosphere(min_points)?;
         let vertices = Arc::new(make_vertices(&icosphere));
         Ok(Self::from_vertices(vertices, Some(default_data)))
@@ -269,6 +286,7 @@ impl IcoTable4D {
 }
 
 impl Table6D {
+    /// Create a 6D table spanning `[r_min, r_max]` with given radial and angular resolution.
     pub fn from_resolution(r_min: f64, r_max: f64, dr: f64, angle_resolution: f64) -> Result<Self> {
         let n_points = (4.0 * PI / angle_resolution.powi(2)).round() as usize;
         let icosphere = make_icosphere(n_points)?;
@@ -291,6 +309,7 @@ impl Table6D {
         Ok(Self::new(r_min, r_max, dr, table_omega))
     }
 
+    /// Get the 4D angular table for a given radial distance and dihedral angle.
     pub fn get_icospheres(&self, r: f64, omega: f64) -> Result<&IcoTable4D> {
         self.get(r)?.get(omega)
     }
@@ -334,6 +353,7 @@ impl IcoTable2D<f64> {
             + bary[2] * self.data[face[2]].get().unwrap()
     }
 
+    /// Create an empty 2D table with at least `min_points` vertices.
     pub fn from_min_points(min_points: usize) -> Result<Self> {
         let icosphere = make_icosphere(min_points)?;
         Ok(Self::from_icosphere_without_data(&icosphere))
