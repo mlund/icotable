@@ -17,7 +17,7 @@ pub mod table;
 mod vertex;
 
 // Public API
-pub use flat::{Table3DFlat, Table6DFlat};
+pub use flat::{Table3DFlat, Table6DFlat, TableMetadata, TailCorrectionTerm};
 /// Half-precision float for compact table storage.
 pub use half::f16;
 pub use icosphere::make_icosphere_vertices;

@@ -234,6 +234,32 @@ fn extract_mesh<T: Clone + GetSize>(
     (vertices, neighbors)
 }
 
+/// Single term in a tail correction: `coefficient * exp(-kappa * r) / r^power`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TailCorrectionTerm {
+    /// Pre-exponential coefficient.
+    pub coefficient: f64,
+    /// Screening parameter (inverse length).
+    pub kappa: f64,
+    /// Power of r in the denominator.
+    pub power: u32,
+}
+
+/// Optional metadata attached to a 6D table for tail corrections beyond the table cutoff.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TableMetadata {
+    /// Tail correction terms evaluated as sum of `C * exp(-κr) / r^p`.
+    pub tail_terms: Vec<TailCorrectionTerm>,
+    /// Net charges of the two molecules `[q_a, q_b]` in elementary charges.
+    pub charges: Option<[f64; 2]>,
+    /// Dipole moment magnitudes `[μ_a, μ_b]` in e·Å.
+    pub dipole_moments: Option<[f64; 2]>,
+    /// Temperature in Kelvin used during table generation.
+    pub temperature: Option<f64>,
+    /// Coulomb prefactor e²/(4πε₀εᵣ) in kJ·Å/mol/e², multiplied into all tail terms.
+    pub electric_prefactor: Option<f64>,
+}
+
 /// Flat, serializable 6D lookup table.
 ///
 /// Layout: `data[r_idx * (n_omega * n_v * n_v) + omega_idx * (n_v * n_v) + vi * n_v + vj]`
@@ -259,9 +285,46 @@ pub struct Table6DFlat<T: num_traits::Float> {
     pub neighbors: Vec<Vec<u16>>,
     /// Flat data array.
     pub data: Vec<T>,
+    /// Optional metadata for tail corrections beyond the table cutoff.
+    pub metadata: Option<TableMetadata>,
     /// Cached O(1) vertex locator, lazy-initialized on first lookup.
     #[serde(skip, default)]
     locator: OnceLock<VertexLocator>,
+}
+
+/// Legacy layout without metadata — bincode is not self-describing, so adding
+/// `metadata` changed the wire format and old files need a separate struct.
+#[derive(Serialize, Deserialize)]
+struct Table6DFlatLegacy<T: num_traits::Float> {
+    rmin: f64,
+    rmax: f64,
+    dr: f64,
+    n_r: usize,
+    omega_step: f64,
+    n_omega: usize,
+    n_vertices: usize,
+    vertices: Vec<[f64; 3]>,
+    neighbors: Vec<Vec<u16>>,
+    data: Vec<T>,
+}
+
+impl<T: num_traits::Float> From<Table6DFlatLegacy<T>> for Table6DFlat<T> {
+    fn from(legacy: Table6DFlatLegacy<T>) -> Self {
+        Self {
+            rmin: legacy.rmin,
+            rmax: legacy.rmax,
+            dr: legacy.dr,
+            n_r: legacy.n_r,
+            omega_step: legacy.omega_step,
+            n_omega: legacy.n_omega,
+            n_vertices: legacy.n_vertices,
+            vertices: legacy.vertices,
+            neighbors: legacy.neighbors,
+            data: legacy.data,
+            metadata: None,
+            locator: OnceLock::new(),
+        }
+    }
 }
 
 impl<T: num_traits::Float + Serialize + DeserializeOwned> Table6DFlat<T> {
@@ -269,9 +332,45 @@ impl<T: num_traits::Float + Serialize + DeserializeOwned> Table6DFlat<T> {
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         save_bincode(self, path.as_ref())
     }
-    /// Load from a bincode file (gzip-decompressed if path ends in `.gz`).
+
+    /// Load from a bincode file, falling back to legacy format without metadata.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        load_bincode(path.as_ref())
+        let path = path.as_ref();
+        match load_bincode::<Self>(path) {
+            Ok(table) => Ok(table),
+            Err(primary_err) => {
+                log::debug!("New format failed ({}), trying legacy format", primary_err);
+                Ok(load_bincode::<Table6DFlatLegacy<T>>(path)?.into())
+            }
+        }
+    }
+
+    /// Evaluate tail correction energy beyond the table cutoff.
+    ///
+    /// Returns 0 if no tail terms or no electric prefactor is present.
+    /// Missing prefactor with non-empty terms is a table-generation bug;
+    /// callers should validate at load time, not on every energy evaluation.
+    pub fn tail_energy(&self, r: f64) -> f64 {
+        let m = match self.metadata.as_ref() {
+            Some(m) if !m.tail_terms.is_empty() => m,
+            _ => return 0.0,
+        };
+        let prefactor = m.electric_prefactor.unwrap_or(0.0);
+        prefactor
+            * m.tail_terms
+                .iter()
+                .map(|t| t.coefficient * (-t.kappa * r).exp() / r.powi(t.power as i32))
+                .sum::<f64>()
+    }
+
+    /// Validate that tail correction metadata is self-consistent.
+    pub fn validate_metadata(&self) -> Result<()> {
+        if let Some(m) = &self.metadata {
+            if !m.tail_terms.is_empty() && m.electric_prefactor.is_none() {
+                anyhow::bail!("tail correction terms present but electric_prefactor is missing");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -329,6 +428,7 @@ fn build_flat_6d<T: num_traits::Float + Copy>(
         vertices,
         neighbors,
         data,
+        metadata: None,
         locator: OnceLock::new(),
     })
 }
@@ -741,6 +841,7 @@ mod tests {
             vertices,
             neighbors,
             data,
+            metadata: None,
             locator: OnceLock::new(),
         }
     }
@@ -823,6 +924,7 @@ mod tests {
             vertices,
             neighbors,
             data,
+            metadata: None,
             locator: OnceLock::new(),
         };
 
@@ -880,6 +982,7 @@ mod tests {
             vertices,
             neighbors,
             data,
+            metadata: None,
             locator: OnceLock::new(),
         }
     }
@@ -988,6 +1091,7 @@ mod tests {
             vertices: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             neighbors: vec![vec![1, 2], vec![0, 2], vec![0, 1]],
             data: vec![1.0; 5 * 4 * 3 * 3],
+            metadata: None,
             locator: OnceLock::new(),
         };
         let dir = tempfile::tempdir().unwrap();
@@ -1076,6 +1180,7 @@ mod tests {
             vertices: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             neighbors: vec![vec![1, 2], vec![0, 2], vec![0, 1]],
             data: vec![f16::from_f64(1.0); 5 * 4 * 3 * 3],
+            metadata: None,
             locator: OnceLock::new(),
         };
         let dir = tempfile::tempdir().unwrap();
@@ -1108,6 +1213,7 @@ mod tests {
             vertices,
             neighbors,
             data,
+            metadata: None,
             locator: OnceLock::new(),
         };
         let dir_a = Vector3::new(1.0, 0.0, 0.0);
@@ -1163,6 +1269,7 @@ mod tests {
             vertices: vertices.clone(),
             neighbors: neighbors.clone(),
             data: data.clone(),
+            metadata: None,
             locator: OnceLock::new(),
         };
 
@@ -1184,6 +1291,7 @@ mod tests {
             vertices: rv,
             neighbors: rn,
             data: rd,
+            metadata: None,
             locator: OnceLock::new(),
         };
 
@@ -1242,5 +1350,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn round_trip_with_metadata() {
+        let table = Table6DFlat::<f32> {
+            rmin: 5.0,
+            rmax: 10.0,
+            dr: 1.0,
+            n_r: 5,
+            omega_step: 0.5,
+            n_omega: 4,
+            n_vertices: 3,
+            vertices: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            neighbors: vec![vec![1, 2], vec![0, 2], vec![0, 1]],
+            data: vec![1.0; 5 * 4 * 3 * 3],
+            metadata: Some(TableMetadata {
+                tail_terms: vec![
+                    TailCorrectionTerm { coefficient: 100.0, kappa: 0.3, power: 1 },
+                    TailCorrectionTerm { coefficient: -5.0, kappa: 0.1, power: 4 },
+                ],
+                charges: Some([1.0, -1.0]),
+                dipole_moments: Some([2.5, 0.0]),
+                temperature: Some(298.15),
+                electric_prefactor: Some(17.83),
+            }),
+            locator: OnceLock::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.bin.gz");
+        table.save(&path).unwrap();
+        let loaded = Table6DFlat::<f32>::load(&path).unwrap();
+        let meta = loaded.metadata.as_ref().expect("metadata missing");
+        assert_eq!(meta.tail_terms.len(), 2);
+        assert_eq!(meta.charges, Some([1.0, -1.0]));
+        assert_eq!(meta.temperature, Some(298.15));
+    }
+
+    #[test]
+    fn load_legacy_without_metadata() {
+        // Serialize a legacy struct (no metadata field), then load via Table6DFlat
+        let legacy = Table6DFlatLegacy::<f32> {
+            rmin: 5.0,
+            rmax: 10.0,
+            dr: 1.0,
+            n_r: 5,
+            omega_step: 0.5,
+            n_omega: 4,
+            n_vertices: 3,
+            vertices: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            neighbors: vec![vec![1, 2], vec![0, 2], vec![0, 1]],
+            data: vec![1.0; 5 * 4 * 3 * 3],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.bin");
+        save_bincode(&legacy, &path).unwrap();
+        let loaded = Table6DFlat::<f32>::load(&path).unwrap();
+        assert!(loaded.metadata.is_none());
+        assert_eq!(loaded.n_vertices, 3);
+        assert_eq!(loaded.data.len(), 5 * 4 * 3 * 3);
+    }
+
+    #[test]
+    fn tail_energy_evaluation() {
+        let mut table = make_test_table(1, 3, 4);
+        // No metadata → tail_energy returns 0
+        assert_eq!(table.tail_energy(20.0), 0.0);
+
+        table.metadata = Some(TableMetadata {
+            tail_terms: vec![
+                TailCorrectionTerm { coefficient: 100.0, kappa: 0.1, power: 1 },
+            ],
+            electric_prefactor: Some(2.5),
+            ..Default::default()
+        });
+        // 2.5 * 100 * exp(-0.1 * 20) / 20
+        let expected = 2.5 * 100.0 * (-2.0_f64).exp() / 20.0;
+        let got = table.tail_energy(20.0);
+        assert!((got - expected).abs() < 1e-10, "expected {expected}, got {got}");
     }
 }
