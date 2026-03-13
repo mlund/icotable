@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 /// Save a bincode-serializable value. A `.gz` suffix enables gzip compression.
-fn save_bincode(value: &impl Serialize, path: &Path) -> Result<()> {
+pub(crate) fn save_bincode(value: &impl Serialize, path: &Path) -> Result<()> {
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
     if path.extension().is_some_and(|ext| ext == "gz") {
         bincode::serialize_into(GzEncoder::new(file, Compression::default()), value)?;
@@ -29,7 +29,7 @@ fn save_bincode(value: &impl Serialize, path: &Path) -> Result<()> {
 }
 
 /// Load a bincode-deserializable value. A `.gz` suffix enables gzip decompression.
-fn load_bincode<T: DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn load_bincode<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let file = std::io::BufReader::new(std::fs::File::open(path)?);
     Ok(if path.extension().is_some_and(|ext| ext == "gz") {
         bincode::deserialize_from(GzDecoder::new(file))?
@@ -42,7 +42,7 @@ fn load_bincode<T: DeserializeOwned>(path: &Path) -> Result<T> {
 ///
 /// The cube face is determined by the dominant axis component. `u` and `w`
 /// are the projected coordinates in [-1, 1] on that face.
-fn cube_project(v: &[f64; 3]) -> (usize, f64, f64) {
+pub(crate) fn cube_project(v: &[f64; 3]) -> (usize, f64, f64) {
     let (ax, ay, az) = (v[0].abs(), v[1].abs(), v[2].abs());
     let (face_id, u, w, d) = if ax >= ay && ax >= az {
         if v[0] > 0.0 {
@@ -69,7 +69,7 @@ fn cube_project(v: &[f64; 3]) -> (usize, f64, f64) {
 /// Enumerates all neighbor pairs sharing an edge (actual mesh triangles)
 /// rather than just the two closest neighbors, which would often select
 /// non-adjacent vertices and yield a spurious triangle.
-fn search_triangles(
+pub(crate) fn search_triangles(
     nearest: usize,
     dir: &Vector3,
     vertices: &[[f64; 3]],
@@ -118,14 +118,14 @@ fn search_triangles(
 /// lookup maps to a single cube face and grid cell, scanning only the few
 /// candidate vertices stored there instead of all V vertices.
 #[derive(Clone, Debug)]
-struct VertexLocator {
+pub(crate) struct VertexLocator {
     grid_size: usize,
     /// Flat layout: index = `face_id * g*g + ci*g + cj`.
     cells: Vec<Vec<u16>>,
 }
 
 impl VertexLocator {
-    fn new(vertices: &[[f64; 3]]) -> Self {
+    pub(crate) fn new(vertices: &[[f64; 3]]) -> Self {
         let n = vertices.len();
         let grid_size = ((n as f64 / 6.0).sqrt() * 1.2).ceil() as usize;
         let grid_size = grid_size.max(2);
@@ -168,7 +168,7 @@ impl VertexLocator {
         Self { grid_size, cells }
     }
 
-    fn find_face_bary(
+    pub(crate) fn find_face_bary(
         &self,
         dir: &Vector3,
         vertices: &[[f64; 3]],
@@ -223,9 +223,7 @@ fn vertex_vec3(vertices: &[[f64; 3]], i: usize) -> Vector3 {
 }
 
 /// Extract normalized vertex positions and neighbor lists from an `IcoTable2D`.
-fn extract_mesh<T: Clone + GetSize>(
-    ico: &IcoTable2D<T>,
-) -> (Vec<[f64; 3]>, Vec<Vec<u16>>) {
+fn extract_mesh<T: Clone + GetSize>(ico: &IcoTable2D<T>) -> (Vec<[f64; 3]>, Vec<Vec<u16>>) {
     let vertices = ico
         .iter_positions()
         .map(|p| <[f64; 3]>::from(p.normalize()))
@@ -415,7 +413,14 @@ fn build_flat_6d<T: num_traits::Float + Copy>(
     }
 
     let perm = bfs_vertex_permutation(&neighbors);
-    apply_vertex_permutation(&perm, &mut vertices, &mut neighbors, &mut data, n_vertices, n_vertices);
+    apply_vertex_permutation(
+        &perm,
+        &mut vertices,
+        &mut neighbors,
+        &mut data,
+        n_vertices,
+        n_vertices,
+    );
 
     Ok(Table6DFlat {
         rmin: r_min,
@@ -465,7 +470,9 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
         let oi = (omega / self.omega_step + 0.5) as usize % self.n_omega;
         let base = ri * self.n_omega * self.n_vertices * self.n_vertices
             + oi * self.n_vertices * self.n_vertices;
-        let loc = self.locator.get_or_init(|| VertexLocator::new(&self.vertices));
+        let loc = self
+            .locator
+            .get_or_init(|| VertexLocator::new(&self.vertices));
         let (face_a, bary_a) = loc.find_face_bary(dir_a, &self.vertices, &self.neighbors);
         let (face_b, bary_b) = loc.find_face_bary(dir_b, &self.vertices, &self.neighbors);
         Some((base, face_a, bary_a, face_b, bary_b))
@@ -473,11 +480,11 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
 
     /// Lookup value by nearest R/ω bin and barycentric interpolation on icospheres.
     pub fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3) -> f64 {
-        let (base, face_a, bary_a, face_b, bary_b) =
-            match self.resolve_bins(r, omega, dir_a, dir_b) {
-                Some(v) => v,
-                None => return 0.0,
-            };
+        let (base, face_a, bary_a, face_b, bary_b) = match self.resolve_bins(r, omega, dir_a, dir_b)
+        {
+            Some(v) => v,
+            None => return 0.0,
+        };
         let mut result = 0.0;
         for i in 0..3 {
             for j in 0..3 {
@@ -503,11 +510,11 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
         beta: f64,
     ) -> f64 {
         debug_assert!(beta > 0.0, "beta must be positive, got {beta}");
-        let (base, face_a, bary_a, face_b, bary_b) =
-            match self.resolve_bins(r, omega, dir_a, dir_b) {
-                Some(v) => v,
-                None => return 0.0,
-            };
+        let (base, face_a, bary_a, face_b, bary_b) = match self.resolve_bins(r, omega, dir_a, dir_b)
+        {
+            Some(v) => v,
+            None => return 0.0,
+        };
 
         // Shift by u_min before exp() to prevent fp overflow (log-sum-exp trick);
         // the final `+ u_min` restores the correct result.
@@ -542,7 +549,7 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
 }
 
 /// BFS traversal from vertex 0, returning a permutation `old_index → new_index`.
-fn bfs_vertex_permutation(neighbors: &[Vec<u16>]) -> Vec<usize> {
+pub(crate) fn bfs_vertex_permutation(neighbors: &[Vec<u16>]) -> Vec<usize> {
     let n = neighbors.len();
     let mut new_of_old = vec![usize::MAX; n];
     let mut queue = VecDeque::with_capacity(n);
@@ -573,7 +580,7 @@ fn bfs_vertex_permutation(neighbors: &[Vec<u16>]) -> Vec<usize> {
 ///
 /// `entries_per_vertex` is 1 for 3D tables or `n_v` for 6D tables (where each
 /// slab has `n_v * n_v` entries indexed by two vertex indices).
-fn apply_vertex_permutation<T: Copy>(
+pub(crate) fn apply_vertex_permutation<T: Copy>(
     perm: &[usize],
     vertices: &mut [[f64; 3]],
     neighbors: &mut [Vec<u16>],
@@ -759,7 +766,14 @@ fn build_flat_3d<T: num_traits::Float + Copy>(
     }
 
     let perm = bfs_vertex_permutation(&neighbors);
-    apply_vertex_permutation(&perm, &mut vertices, &mut neighbors, &mut data, n_vertices, 1);
+    apply_vertex_permutation(
+        &perm,
+        &mut vertices,
+        &mut neighbors,
+        &mut data,
+        n_vertices,
+        1,
+    );
 
     Ok(Table3DFlat {
         rmin: r_min,
@@ -797,7 +811,9 @@ impl<T: num_traits::Float + Into<f64>> Table3DFlat<T> {
         let ri = ((r - self.rmin) / self.dr + 0.5) as usize;
         let ri = ri.min(self.n_r.saturating_sub(1));
 
-        let loc = self.locator.get_or_init(|| VertexLocator::new(&self.vertices));
+        let loc = self
+            .locator
+            .get_or_init(|| VertexLocator::new(&self.vertices));
         let (face, bary) = loc.find_face_bary(direction, &self.vertices, &self.neighbors);
         let base = ri * self.n_vertices;
 
@@ -1367,8 +1383,16 @@ mod tests {
             data: vec![1.0; 5 * 4 * 3 * 3],
             metadata: Some(TableMetadata {
                 tail_terms: vec![
-                    TailCorrectionTerm { coefficient: 100.0, kappa: 0.3, power: 1 },
-                    TailCorrectionTerm { coefficient: -5.0, kappa: 0.1, power: 4 },
+                    TailCorrectionTerm {
+                        coefficient: 100.0,
+                        kappa: 0.3,
+                        power: 1,
+                    },
+                    TailCorrectionTerm {
+                        coefficient: -5.0,
+                        kappa: 0.1,
+                        power: 4,
+                    },
                 ],
                 charges: Some([1.0, -1.0]),
                 dipole_moments: Some([2.5, 0.0]),
@@ -1418,15 +1442,20 @@ mod tests {
         assert_eq!(table.tail_energy(20.0), 0.0);
 
         table.metadata = Some(TableMetadata {
-            tail_terms: vec![
-                TailCorrectionTerm { coefficient: 100.0, kappa: 0.1, power: 1 },
-            ],
+            tail_terms: vec![TailCorrectionTerm {
+                coefficient: 100.0,
+                kappa: 0.1,
+                power: 1,
+            }],
             electric_prefactor: Some(2.5),
             ..Default::default()
         });
         // 2.5 * 100 * exp(-0.1 * 20) / 20
         let expected = 2.5 * 100.0 * (-2.0_f64).exp() / 20.0;
         let got = table.tail_energy(20.0);
-        assert!((got - expected).abs() < 1e-10, "expected {expected}, got {got}");
+        assert!(
+            (got - expected).abs() < 1e-10,
+            "expected {expected}, got {got}"
+        );
     }
 }

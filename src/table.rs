@@ -112,7 +112,10 @@ impl<T: Clone + GetSize> PaddedTable<T> {
         let raw = (key - self.min) / self.res + 0.5;
         ensure!(raw >= 0.0, "Key {key} is below the padded range");
         let index = raw as usize;
-        ensure!(index < self.data.len(), "Key {key} is above the padded range");
+        ensure!(
+            index < self.data.len(),
+            "Key {key} is above the padded range"
+        );
         Ok(index)
     }
 

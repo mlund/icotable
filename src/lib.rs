@@ -4,11 +4,13 @@
 //! Stores pre-computed scalar data over (R, ω, θ₁φ₁, θ₂φ₂) using icosphere
 //! tessellation with barycentric interpolation for the angular dimensions.
 
+/// Adaptive 6D tables with per-R-slice resolution for fast generation and compact storage.
+pub mod adaptive;
 /// Portable, flat representations of angular tables for file I/O and fast lookup.
 pub mod flat;
-mod icosphere;
 /// Core icosphere tables and barycentric interpolation.
 pub mod ico;
+mod icosphere;
 /// Forward and inverse coordinate transforms.
 pub mod orient;
 mod spherical;
@@ -17,17 +19,18 @@ pub mod table;
 mod vertex;
 
 // Public API
+pub use adaptive::{AdaptiveBuilder, Table6DAdaptive};
 pub use flat::{Table3DFlat, Table6DFlat, TableMetadata, TailCorrectionTerm};
 /// Half-precision float for compact table storage.
 pub use half::f16;
-pub use icosphere::make_icosphere_vertices;
 pub use ico::{Face, IcoTable2D, IcoTable4D, Table6D};
+pub use icosphere::make_icosphere_vertices;
 pub use orient::{inverse_orient, orient};
 pub use spherical::SphericalCoord;
 pub use table::PaddedTable;
 
 // Crate-internal re-exports
-pub(crate) use icosphere::make_icosphere;
+pub(crate) use icosphere::{make_icosphere, make_icosphere_by_ndiv};
 pub(crate) use vertex::{make_vertices, Vertex};
 
 /// 3×3 matrix of `f64`.

@@ -7,6 +7,13 @@ use hexasphere::AdjacencyBuilder;
 
 const UNIT_SPHERE_AREA: f64 = 4.0 * PI;
 
+/// Create icosphere directly from a subdivision level.
+///
+/// Vertex count: N = 10 × (n_div + 1)² + 2.
+pub fn make_icosphere_by_ndiv(n_div: usize) -> IcoSphere {
+    IcoSphere::new(n_div, |_| ())
+}
+
 /// Create icosphere with at least `min_points` surface vertices.
 ///
 /// Vertex count: N = 10 × (n_divisions + 1)² + 2.

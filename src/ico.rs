@@ -311,7 +311,10 @@ impl IcoTable4D {
 
     /// Create a 4D table with at least `min_points` vertices, filled with `default_data`.
     #[cfg(test)]
-    pub(crate) fn from_min_points(min_points: usize, default_data: IcoTable2D<f64>) -> Result<Self> {
+    pub(crate) fn from_min_points(
+        min_points: usize,
+        default_data: IcoTable2D<f64>,
+    ) -> Result<Self> {
         let icosphere = make_icosphere(min_points)?;
         let vertices = Arc::new(make_vertices(&icosphere));
         Ok(Self::from_vertices(vertices, Some(default_data)))
