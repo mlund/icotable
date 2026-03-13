@@ -12,6 +12,7 @@ use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use get_size::GetSize;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Save a bincode-serializable value. A `.gz` suffix enables gzip compression.
 fn save_bincode(value: &impl Serialize, path: &Path) -> Result<()> {
@@ -34,10 +35,168 @@ fn load_bincode<T: DeserializeOwned>(path: &Path) -> Result<T> {
     })
 }
 
+/// Project a 3D point onto one of 6 cube faces, returning `(face_id, u, w)`.
+///
+/// The cube face is determined by the dominant axis component. `u` and `w`
+/// are the projected coordinates in [-1, 1] on that face.
+fn cube_project(v: &[f64; 3]) -> (usize, f64, f64) {
+    let (ax, ay, az) = (v[0].abs(), v[1].abs(), v[2].abs());
+    let (face_id, u, w, d) = if ax >= ay && ax >= az {
+        if v[0] > 0.0 {
+            (0, v[1], v[2], v[0])
+        } else {
+            (1, -v[1], v[2], -v[0])
+        }
+    } else if ay >= az {
+        if v[1] > 0.0 {
+            (2, v[0], v[2], v[1])
+        } else {
+            (3, -v[0], v[2], -v[1])
+        }
+    } else if v[2] > 0.0 {
+        (4, v[0], v[1], v[2])
+    } else {
+        (5, -v[0], v[1], -v[2])
+    };
+    (face_id, u / d, w / d)
+}
+
+/// Search mesh triangles adjacent to `nearest` for the best-fitting face.
+///
+/// Enumerates all neighbor pairs sharing an edge (actual mesh triangles)
+/// rather than just the two closest neighbors, which would often select
+/// non-adjacent vertices and yield a spurious triangle.
+fn search_triangles(
+    nearest: usize,
+    dir: &Vector3,
+    vertices: &[[f64; 3]],
+    neighbors: &[Vec<u16>],
+) -> (Face, [f64; 3]) {
+    let nbrs = &neighbors[nearest];
+    let mut best_face = [0usize; 3];
+    let mut best_min_bary = f64::NEG_INFINITY;
+
+    for (idx_i, &ni) in nbrs.iter().enumerate() {
+        let ni = ni as usize;
+        for &nj in &nbrs[idx_i + 1..] {
+            let nj = nj as usize;
+            if !neighbors[ni].contains(&(nj as u16)) {
+                continue;
+            }
+            let face = [nearest, ni, nj];
+            let bary = projected_barycentric(
+                dir,
+                &vertex_vec3(vertices, face[0]),
+                &vertex_vec3(vertices, face[1]),
+                &vertex_vec3(vertices, face[2]),
+            );
+            let min_b = bary[0].min(bary[1]).min(bary[2]);
+            if min_b > best_min_bary {
+                best_min_bary = min_b;
+                best_face = face;
+            }
+        }
+    }
+
+    best_face.sort_unstable();
+    let best_bary = projected_barycentric(
+        dir,
+        &vertex_vec3(vertices, best_face[0]),
+        &vertex_vec3(vertices, best_face[1]),
+        &vertex_vec3(vertices, best_face[2]),
+    );
+    (best_face, best_bary)
+}
+
+/// O(1) nearest-vertex lookup via cube-face projected grids.
+///
+/// Each vertex is projected onto the six faces of a cube and binned into a
+/// G×G grid, with 1-cell margin overlap to handle boundary cases. A direction
+/// lookup maps to a single cube face and grid cell, scanning only the few
+/// candidate vertices stored there instead of all V vertices.
+#[derive(Clone, Debug)]
+struct VertexLocator {
+    grid_size: usize,
+    /// Flat layout: index = `face_id * g*g + ci*g + cj`.
+    cells: Vec<Vec<u16>>,
+}
+
+impl VertexLocator {
+    fn new(vertices: &[[f64; 3]]) -> Self {
+        let n = vertices.len();
+        let grid_size = ((n as f64 / 6.0).sqrt() * 1.2).ceil() as usize;
+        let grid_size = grid_size.max(2);
+        let g = grid_size;
+        let mut cells = vec![Vec::new(); 6 * g * g];
+
+        for (vi, v) in vertices.iter().enumerate() {
+            for face_id in 0..6 {
+                let (u, w, d) = match face_id {
+                    0 => (v[1], v[2], v[0]),
+                    1 => (-v[1], v[2], -v[0]),
+                    2 => (v[0], v[2], v[1]),
+                    3 => (-v[0], v[2], -v[1]),
+                    4 => (v[0], v[1], v[2]),
+                    5 => (-v[0], v[1], -v[2]),
+                    _ => unreachable!(),
+                };
+                if d <= 0.0 {
+                    continue;
+                }
+                let (u, w) = (u / d, w / d);
+                let ci = ((u * 0.5 + 0.5) * g as f64) as isize;
+                let cj = ((w * 0.5 + 0.5) * g as f64) as isize;
+                for di in -1..=1isize {
+                    for dj in -1..=1isize {
+                        let ci2 = ci + di;
+                        let cj2 = cj + dj;
+                        if ci2 >= 0 && ci2 < g as isize && cj2 >= 0 && cj2 < g as isize {
+                            let idx = face_id * g * g + ci2 as usize * g + cj2 as usize;
+                            let cell = &mut cells[idx];
+                            if !cell.contains(&(vi as u16)) {
+                                cell.push(vi as u16);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Self { grid_size, cells }
+    }
+
+    fn find_face_bary(
+        &self,
+        dir: &Vector3,
+        vertices: &[[f64; 3]],
+        neighbors: &[Vec<u16>],
+    ) -> (Face, [f64; 3]) {
+        let dir = dir.normalize();
+        let (face_id, u, w) = cube_project(&[dir.x, dir.y, dir.z]);
+        let g = self.grid_size;
+        let ci = ((u * 0.5 + 0.5) * g as f64).clamp(0.0, g as f64 - 1.0) as usize;
+        let cj = ((w * 0.5 + 0.5) * g as f64).clamp(0.0, g as f64 - 1.0) as usize;
+        let candidates = &self.cells[face_id * g * g + ci * g + cj];
+
+        let nearest = candidates
+            .iter()
+            .map(|&vi| {
+                let vi = vi as usize;
+                let d = (dir - Vector3::from(vertices[vi])).norm_squared();
+                (vi, d)
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("grid cell must not be empty")
+            .0;
+
+        search_triangles(nearest, &dir, vertices, neighbors)
+    }
+}
+
 /// Find the mesh face containing `dir` and return barycentric coordinates.
 ///
-/// Searches all triangles incident on the nearest vertex (formed by pairs of
-/// mutual neighbors) for one where all barycentric coordinates are non-negative.
+/// O(V) linear scan reference implementation, kept for test verification.
+#[cfg(test)]
 fn find_face_bary(
     dir: &Vector3,
     vertices: &[[f64; 3]],
@@ -53,46 +212,7 @@ fn find_face_bary(
         .expect("vertices must not be empty")
         .0;
 
-    let nbrs = &neighbors[nearest];
-
-    // Search all neighbor pairs that share an edge (= actual mesh triangle).
-    // Picking the two closest neighbors would often select non-adjacent vertices,
-    // yielding a spurious triangle and poor interpolation.
-    let mut best_face = [0usize; 3];
-    let mut best_min_bary = f64::NEG_INFINITY;
-
-    for (idx_i, &ni) in nbrs.iter().enumerate() {
-        let ni = ni as usize;
-        for &nj in &nbrs[idx_i + 1..] {
-            let nj = nj as usize;
-            if !neighbors[ni].contains(&(nj as u16)) {
-                continue;
-            }
-            let face = [nearest, ni, nj];
-            let bary = projected_barycentric(
-                &dir,
-                &vertex_vec3(vertices, face[0]),
-                &vertex_vec3(vertices, face[1]),
-                &vertex_vec3(vertices, face[2]),
-            );
-            let min_b = bary[0].min(bary[1]).min(bary[2]);
-            if min_b > best_min_bary {
-                best_min_bary = min_b;
-                best_face = face;
-            }
-        }
-    }
-
-    // Recompute barycentric coords for the sorted face (index order matters for lookup)
-    best_face.sort_unstable();
-    let best_bary = projected_barycentric(
-        &dir,
-        &vertex_vec3(vertices, best_face[0]),
-        &vertex_vec3(vertices, best_face[1]),
-        &vertex_vec3(vertices, best_face[2]),
-    );
-
-    (best_face, best_bary)
+    search_triangles(nearest, &dir, vertices, neighbors)
 }
 
 fn vertex_vec3(vertices: &[[f64; 3]], i: usize) -> Vector3 {
@@ -136,6 +256,9 @@ pub struct Table6DFlat<T: num_traits::Float> {
     pub neighbors: Vec<Vec<u16>>,
     /// Flat data array.
     pub data: Vec<T>,
+    /// Cached O(1) vertex locator, lazy-initialized on first lookup.
+    #[serde(skip, default)]
+    locator: OnceLock<VertexLocator>,
 }
 
 impl<T: num_traits::Float + Serialize + DeserializeOwned> Table6DFlat<T> {
@@ -195,6 +318,7 @@ impl TryFrom<&Table6D> for Table6DFlat<f32> {
             vertices,
             neighbors,
             data,
+            locator: OnceLock::new(),
         })
     }
 }
@@ -217,8 +341,9 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
         let oi = (omega / self.omega_step + 0.5) as usize % self.n_omega;
         let base = ri * self.n_omega * self.n_vertices * self.n_vertices
             + oi * self.n_vertices * self.n_vertices;
-        let (face_a, bary_a) = find_face_bary(dir_a, &self.vertices, &self.neighbors);
-        let (face_b, bary_b) = find_face_bary(dir_b, &self.vertices, &self.neighbors);
+        let loc = self.locator.get_or_init(|| VertexLocator::new(&self.vertices));
+        let (face_a, bary_a) = loc.find_face_bary(dir_a, &self.vertices, &self.neighbors);
+        let (face_b, bary_b) = loc.find_face_bary(dir_b, &self.vertices, &self.neighbors);
         Some((base, face_a, bary_a, face_b, bary_b))
     }
 
@@ -378,6 +503,9 @@ pub struct Table3DFlat<T: num_traits::Float> {
     pub neighbors: Vec<Vec<u16>>,
     /// Flat data array.
     pub data: Vec<T>,
+    /// Cached O(1) vertex locator, lazy-initialized on first lookup.
+    #[serde(skip, default)]
+    locator: OnceLock<VertexLocator>,
 }
 
 impl<T: num_traits::Float + Serialize + DeserializeOwned> Table3DFlat<T> {
@@ -423,6 +551,7 @@ impl TryFrom<&PaddedTable<IcoTable2D<f64>>> for Table3DFlat<f32> {
             vertices,
             neighbors,
             data,
+            locator: OnceLock::new(),
         })
     }
 }
@@ -436,7 +565,8 @@ impl<T: num_traits::Float + Into<f64>> Table3DFlat<T> {
         let ri = ((r - self.rmin) / self.dr + 0.5) as usize;
         let ri = ri.min(self.n_r.saturating_sub(1));
 
-        let (face, bary) = find_face_bary(direction, &self.vertices, &self.neighbors);
+        let loc = self.locator.get_or_init(|| VertexLocator::new(&self.vertices));
+        let (face, bary) = loc.find_face_bary(direction, &self.vertices, &self.neighbors);
         let base = ri * self.n_vertices;
 
         let mut result = 0.0;
@@ -479,6 +609,7 @@ mod tests {
             vertices,
             neighbors,
             data,
+            locator: OnceLock::new(),
         }
     }
 
@@ -560,6 +691,7 @@ mod tests {
             vertices,
             neighbors,
             data,
+            locator: OnceLock::new(),
         };
 
         // Query exactly at vertex 0 direction for both → should get 0+0=0
@@ -616,6 +748,7 @@ mod tests {
             vertices,
             neighbors,
             data,
+            locator: OnceLock::new(),
         }
     }
 
@@ -723,6 +856,7 @@ mod tests {
             vertices: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             neighbors: vec![vec![1, 2], vec![0, 2], vec![0, 1]],
             data: vec![1.0; 5 * 4 * 3 * 3],
+            locator: OnceLock::new(),
         };
         let dir = tempfile::tempdir().unwrap();
 
@@ -761,6 +895,7 @@ mod tests {
             vertices,
             neighbors,
             data,
+            locator: OnceLock::new(),
         }
     }
 
@@ -793,5 +928,36 @@ mod tests {
         let loaded = Table3DFlat::<f32>::load(&gz_path).unwrap();
         assert_eq!(loaded.n_vertices, table.n_vertices);
         assert_eq!(loaded.data, table.data);
+    }
+
+    /// Verify that `VertexLocator` produces identical results to the O(V) reference.
+    #[test]
+    fn locator_matches_linear_scan() {
+        use rand::Rng;
+
+        let (_, vertices, neighbors) = make_test_mesh(162);
+        let locator = VertexLocator::new(&vertices);
+        let mut rng = rand::thread_rng();
+
+        for _ in 0..1000 {
+            let dir = loop {
+                let x: f64 = rng.gen_range(-1.0..1.0);
+                let y: f64 = rng.gen_range(-1.0..1.0);
+                let z: f64 = rng.gen_range(-1.0..1.0);
+                let r2 = x * x + y * y + z * z;
+                if r2 > 0.01 && r2 < 1.0 {
+                    break Vector3::new(x, y, z);
+                }
+            };
+            let (face_ref, bary_ref) = find_face_bary(&dir, &vertices, &neighbors);
+            let (face_loc, bary_loc) = locator.find_face_bary(&dir, &vertices, &neighbors);
+            assert_eq!(face_ref, face_loc, "Face mismatch for dir={dir:?}");
+            for k in 0..3 {
+                assert!(
+                    (bary_ref[k] - bary_loc[k]).abs() < 1e-12,
+                    "Bary mismatch for dir={dir:?}: ref={bary_ref:?}, loc={bary_loc:?}"
+                );
+            }
+        }
     }
 }
