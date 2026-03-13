@@ -1,14 +1,14 @@
 #![warn(missing_docs)]
 //! Icosphere-based 6D angular lookup tables for rigid molecule-molecule interactions.
 //!
-//! Stores pre-computed energies over (R, ω, θ₁φ₁, θ₂φ₂) using icosphere
+//! Stores pre-computed scalar data over (R, ω, θ₁φ₁, θ₂φ₂) using icosphere
 //! tessellation with barycentric interpolation for the angular dimensions.
 
 /// Portable, flat representations of angular tables for file I/O and fast lookup.
 pub mod flat;
 mod icosphere;
-/// Icosphere-based angular lookup tables and interpolation.
-pub mod icotable;
+/// Core icosphere tables and barycentric interpolation.
+pub mod ico;
 /// Forward and inverse coordinate transforms.
 pub mod orient;
 mod spherical;
@@ -19,7 +19,7 @@ mod vertex;
 // Public API
 pub use flat::{Table3DFlat, Table6DFlat};
 pub use icosphere::make_icosphere_vertices;
-pub use icotable::{Face, IcoTable2D, IcoTable4D, Table6D};
+pub use ico::{Face, IcoTable2D, IcoTable4D, Table6D};
 pub use orient::{inverse_orient, orient};
 pub use spherical::SphericalCoord;
 pub use table::PaddedTable;

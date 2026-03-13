@@ -1,3 +1,27 @@
+//! Icosphere-based angular lookup tables with barycentric interpolation.
+//!
+//! An icosphere is a subdivision of a regular icosahedron projected onto a
+//! sphere, giving a near-uniform distribution of vertices over the surface.
+//! This module uses that tessellation to store and interpolate scalar data
+//! as a function of direction.
+//!
+//! # Key types
+//!
+//! | Type | Dimensions | Description |
+//! |------|-----------|-------------|
+//! | [`IcoTable2D<T>`] | 2 (θ, φ) | Single angular direction on a sphere |
+//! | [`IcoTable4D`] | 4 (θ₁φ₁, θ₂φ₂) | Two angular directions (e.g. two molecules) |
+//! | [`Table6D`] | 6 (R, ω, θ₁φ₁, θ₂φ₂) | Full radial + dihedral + angular table |
+//!
+//! # Typical workflow
+//!
+//! 1. Create a table with [`Table6D::from_resolution`] or
+//!    [`IcoTable2D::from_min_points`].
+//! 2. Populate vertices with [`IcoTable2D::set_vertex_data`] (write-once per
+//!    vertex).
+//! 3. Query with [`IcoTable2D::nearest_face`] + [`IcoTable2D::barycentric`],
+//!    or use [`IcoTable2D::interpolate`] / [`IcoTable4D::interpolate`] directly.
+
 use crate::icosphere::make_weights;
 use crate::{
     make_icosphere, make_vertices, table::PaddedTable, IcoSphere, SphericalCoord, Vector3, Vertex,
@@ -11,19 +35,31 @@ use std::fmt::Display;
 use std::io::Write;
 use std::sync::{Arc, OnceLock};
 
-/// A 4D icotable where each vertex holds an icotable of floats.
+/// 4D angular table: two nested icospheres representing a pair of directions
+/// (θ₁φ₁, θ₂φ₂), e.g. the orientations of two interacting molecules.
 pub type IcoTable4D = IcoTable2D<IcoTable2D<f64>>;
 
-/// 6D table: R → ω → (θφ) → (θφ) → f64.
+/// Full 6D interaction table: radial distance **R**, dihedral angle **ω**, and
+/// two angular directions (θ₁φ₁, θ₂φ₂).
+///
+/// The two outermost dimensions (R and ω) use [`PaddedTable`] for periodic /
+/// boundary-padded lookup; the inner four angular dimensions use icosphere
+/// tessellation with barycentric interpolation.
 pub type Table6D = PaddedTable<PaddedTable<IcoTable4D>>;
 
-/// Three vertex indices defining a face.
+/// Sorted triple of vertex indices defining an icosphere face (triangle).
 pub type Face = [usize; 3];
 
-/// Stores data on icosphere vertices with barycentric interpolation.
+/// Lookup table over a single spherical direction (θ, φ), stored on the
+/// vertices of a subdivided icosphere.
 ///
-/// Vertex positions and neighbors are shared via `Arc` to avoid duplication
-/// across nested tables.
+/// Each vertex holds a value of type `T` inside a [`OnceLock`], meaning data
+/// is **write-once**: populate with [`set_vertex_data`](Self::set_vertex_data)
+/// and then query with [`interpolate`](IcoTable2D::<f64>::interpolate) (for
+/// `T = f64`) or read individual vertices with [`get_data`](Self::get_data).
+///
+/// Vertex geometry (positions and neighbor lists) is shared via [`Arc`] so
+/// that nested tables (e.g. [`IcoTable4D`]) do not duplicate the mesh.
 #[derive(Clone, GetSize)]
 pub struct IcoTable2D<T: Clone + GetSize> {
     #[get_size(size = 8)]
@@ -101,7 +137,7 @@ impl<T: Clone + GetSize> IcoTable2D<T> {
         table
     }
 
-    /// Average angular spacing between vertices.
+    /// Average angular spacing between vertices, in radians.
     pub fn angle_resolution(&self) -> f64 {
         (4.0 * PI / self.data.len() as f64).sqrt()
     }
@@ -116,7 +152,10 @@ impl<T: Clone + GetSize> IcoTable2D<T> {
         self.vertices.is_empty()
     }
 
-    /// Set data via generator; can only be called once per vertex due to `OnceLock`.
+    /// Populate all vertices using a generator `f(vertex_index, vertex_position) -> T`.
+    ///
+    /// Each vertex can only be written once (enforced by `OnceLock`); calling
+    /// this on an already-populated table returns an error.
     pub fn set_vertex_data(&self, f: impl Fn(usize, &Vector3) -> T) -> Result<()> {
         ensure!(
             self.data.iter().any(|v| v.get().is_none()),
@@ -138,7 +177,11 @@ impl<T: Clone + GetSize> IcoTable2D<T> {
         }
     }
 
-    /// Iterate over set vertex data values (panics if any vertex is unset).
+    /// Iterate over vertex data values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any vertex has not been populated via [`set_vertex_data`](Self::set_vertex_data).
     pub fn vertex_data(&self) -> impl Iterator<Item = &T> {
         self.data.iter().map(|v| v.get().unwrap())
     }
@@ -155,14 +198,21 @@ impl<T: Clone + GetSize> IcoTable2D<T> {
         self.vertices = Arc::new(new_vertices);
     }
 
-    /// Projected barycentric coordinates (Ericson, "Real-Time Collision Detection", p141-142).
+    /// Projected barycentric coordinates of direction `p` within `face`.
+    ///
+    /// Uses the robust projection method from Ericson, *Real-Time Collision
+    /// Detection*, pp. 141–142. Prefer this over [`naive_barycentric`](Self::naive_barycentric)
+    /// unless the point is known to lie exactly on the face plane.
     pub fn barycentric(&self, p: &Vector3, face: &Face) -> Vector3 {
         let (a, b, c) = self.face_positions(face);
         let b = crate::flat::projected_barycentric(p, &a, &b, &c);
         Vector3::new(b[0], b[1], b[2])
     }
 
-    /// Naive barycentric (assumes point is on the face plane).
+    /// Barycentric coordinates assuming `p` lies exactly on the face plane.
+    ///
+    /// Faster than [`barycentric`](Self::barycentric) but numerically less
+    /// robust for points projected onto the sphere surface.
     #[allow(clippy::suspicious_operation_groupings)]
     pub fn naive_barycentric(&self, p: &Vector3, face: &Face) -> Vector3 {
         let (a, b, c) = self.face_positions(face);
@@ -199,7 +249,8 @@ impl<T: Clone + GetSize> IcoTable2D<T> {
             .0
     }
 
-    /// Find the face (triangle) enclosing a given direction.
+    /// Find the face (triangle) whose vertices are closest to the given
+    /// direction. The returned indices are sorted in ascending order.
     pub fn nearest_face(&self, point: &Vector3) -> Face {
         let point = point.normalize();
         let nearest = self.nearest_vertex(&point);
@@ -266,7 +317,11 @@ impl IcoTable4D {
         Ok(Self::from_vertices(vertices, Some(default_data)))
     }
 
-    /// 4D barycentric interpolation via bilinear matrix form.
+    /// Bilinear barycentric interpolation over two angular directions.
+    ///
+    /// Given faces and barycentric weights for each direction, computes
+    /// `bary_a^T · M · bary_b` where `M[i][j]` is the data at
+    /// `(face_a[i], face_b[j])`.
     pub fn interpolate(
         &self,
         face_a: &Face,
@@ -286,7 +341,13 @@ impl IcoTable4D {
 }
 
 impl Table6D {
-    /// Create a 6D table spanning `[r_min, r_max]` with given radial and angular resolution.
+    /// Create a 6D table spanning radial range `[r_min, r_max]` with step
+    /// `dr` and a target angular resolution in radians.
+    ///
+    /// The number of icosphere vertices is derived from `angle_resolution`;
+    /// a typical value of `0.3` rad gives ~140 vertices per sphere.
+    /// The actual resolution (after rounding to a valid subdivision level)
+    /// is logged at `info` level.
     pub fn from_resolution(r_min: f64, r_max: f64, dr: f64, angle_resolution: f64) -> Result<Self> {
         let n_points = (4.0 * PI / angle_resolution.powi(2)).round() as usize;
         let icosphere = make_icosphere(n_points)?;
@@ -314,7 +375,9 @@ impl Table6D {
         self.get(r)?.get(omega)
     }
 
-    /// Write 5D angular space data to a stream for a single radial distance.
+    /// Write the 5D angular slice at radial distance `r` to `stream`.
+    ///
+    /// Output is space-separated columns: `r ω θ₁ φ₁ θ₂ φ₂ data`.
     pub fn stream_angular_space(&self, r: f64, stream: &mut impl Write) -> Result<()> {
         writeln!(stream, "# r ω θ1 φ1 θ2 φ2 data")?;
         for (omega, angles) in self.get(r)?.iter() {
@@ -344,7 +407,10 @@ impl Table6D {
 }
 
 impl IcoTable2D<f64> {
-    /// Barycentric interpolation on the icosphere surface.
+    /// Interpolate the stored scalar field at the given direction `point`.
+    ///
+    /// `point` is an arbitrary 3D vector (it will be normalised internally
+    /// by [`nearest_face`](Self::nearest_face)); only its direction matters.
     pub fn interpolate(&self, point: &Vector3) -> f64 {
         let face = self.nearest_face(point);
         let bary = self.barycentric(point, &face);
@@ -353,7 +419,11 @@ impl IcoTable2D<f64> {
             + bary[2] * self.data[face[2]].get().unwrap()
     }
 
-    /// Create an empty 2D table with at least `min_points` vertices.
+    /// Create an unpopulated 2D table with at least `min_points` vertices.
+    ///
+    /// The icosphere subdivision level is chosen so that the vertex count is
+    /// ≥ `min_points`. Use [`set_vertex_data`](IcoTable2D::set_vertex_data)
+    /// to populate.
     pub fn from_min_points(min_points: usize) -> Result<Self> {
         let icosphere = make_icosphere(min_points)?;
         Ok(Self::from_icosphere_without_data(&icosphere))

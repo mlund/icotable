@@ -4,7 +4,7 @@
 //! (no nested Arc/OnceLock) for efficient serialization with bincode and
 //! simple interpolation at runtime.
 
-use crate::icotable::{Face, IcoTable2D, IcoTable4D, Table6D};
+use crate::ico::{Face, IcoTable2D, IcoTable4D, Table6D};
 use crate::table::PaddedTable;
 use crate::Vector3;
 use anyhow::Result;
@@ -177,9 +177,9 @@ impl TryFrom<&Table6D> for Table6DFlat<f32> {
             for oi in 0..n_omega {
                 let omega = (oi as f64).mul_add(omega_step, omega_min);
                 let ico4d = table.get_icospheres(r, omega)?;
-                for (vi, vj, energy) in flat_iter_indexed(ico4d, n_vertices) {
+                for (vi, vj, value) in flat_iter_indexed(ico4d, n_vertices) {
                     let idx = ri * stride + oi * (n_vertices * n_vertices) + vi * n_vertices + vj;
-                    data[idx] = *energy as f32;
+                    data[idx] = *value as f32;
                 }
             }
         }
@@ -200,7 +200,7 @@ impl TryFrom<&Table6D> for Table6DFlat<f32> {
 }
 
 impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
-    /// Lookup energy by nearest R/ω bin and barycentric interpolation on icospheres.
+    /// Lookup value by nearest R/ω bin and barycentric interpolation on icospheres.
     pub fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3) -> f64 {
         if r < self.rmin || r > self.rmax {
             return 0.0;
@@ -368,7 +368,7 @@ impl TryFrom<&PaddedTable<IcoTable2D<f64>>> for Table3DFlat<f32> {
 }
 
 impl<T: num_traits::Float + Into<f64>> Table3DFlat<T> {
-    /// Lookup energy by nearest R bin and barycentric interpolation on icosphere.
+    /// Lookup value by nearest R bin and barycentric interpolation on icosphere.
     pub fn lookup(&self, r: f64, direction: &Vector3) -> f64 {
         if r < self.rmin || r > self.rmax {
             return 0.0;
