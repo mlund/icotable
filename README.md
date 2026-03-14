@@ -20,13 +20,18 @@ The crate provides:
 - **`AdaptiveBuilder`** &mdash; drives the table generation protocol, taking
   &beta; = 1/kT to classify repulsive slabs and angular gradients to decide
   resolution and interpolation tier.
+- **`Table3DAdaptive<T>`** &mdash; adaptive 3D table (R, &theta;, &phi;) with per-R-slice
+  angular resolution for rigid body + single atom interactions. Uses the same
+  four-tier slab classification as `Table6DAdaptive`.
+- **`Adaptive3DBuilder`** &mdash; drives 3D table generation, analogous to
+  `AdaptiveBuilder` but for the three-dimensional (no dihedral) case.
 - **`Table6DFlat<T>`** &mdash; flat, bincode-serializable 6D representation with uniform
   angular resolution. Generic over `f32` or `f16` (half-precision via
   [`half`](https://crates.io/crates/half)). BFS vertex reordering improves cache locality.
 - **`Table6D`** &mdash; nested periodic table over (R, &omega;) with `IcoTable4D` angular layers,
   used during table construction.
 - **`Table3DFlat<T>`** &mdash; flat, bincode-serializable 3D table (R, &theta;, &phi;) for
-  rigid body + single atom interactions.
+  rigid body + single atom interactions (uniform resolution, legacy).
 - **`orient` / `inverse_orient`** &mdash; forward and inverse coordinate transforms between
   6D table indices and quaternion + separation-vector representation.
 - **`IcoTable2D<T>`** &mdash; single-icosphere angular table with barycentric interpolation,
@@ -40,7 +45,8 @@ This crate is a shared dependency between:
 
 - [**Duello**](https://github.com/mlund/duello) &mdash; computes 6D energy tables by scanning
   all orientations of two rigid molecules using `AdaptiveBuilder`,
-  and 3D tables for rigid body + single atom interactions (`Table3DFlat`).
+  and adaptive 3D tables for rigid body + single atom interactions
+  using `Adaptive3DBuilder`.
 - [**Faunus**](https://github.com/mlund/faunus-rs) &mdash; loads pre-computed tables for
   O(1) energy lookups during Monte Carlo simulations. Supports both adaptive
   and flat table formats with automatic format detection.
