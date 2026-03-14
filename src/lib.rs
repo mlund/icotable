@@ -31,7 +31,9 @@ pub mod table;
 mod vertex;
 
 // Public API
-pub use adaptive::{AdaptiveBuilder, SlabResolution, Table6DAdaptive};
+pub use adaptive::{
+    Adaptive3DBuilder, AdaptiveBuilder, SlabResolution, Table3DAdaptive, Table6DAdaptive,
+};
 pub use flat::{Table3DFlat, Table6DFlat, TableMetadata, TailCorrectionTerm};
 /// Half-precision float for compact table storage.
 pub use half::f16;

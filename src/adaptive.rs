@@ -16,8 +16,8 @@
 //! temperature, making the table temperature-dependent.
 
 use crate::flat::{
-    apply_vertex_permutation, bfs_vertex_permutation, load_bincode, save_bincode, TableMetadata,
-    VertexLocator,
+    apply_vertex_permutation, bfs_vertex_permutation, load_bincode, save_bincode, FaceGrid,
+    TableMetadata,
 };
 use crate::ico::Face;
 use crate::vertex::make_vertices;
@@ -27,6 +27,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::OnceLock;
+
+/// Boltzmann weight floor: slabs where `exp(−βU) < BOLTZMANN_FLOOR` for all
+/// orientations are thermodynamically dead (MC always rejects). ~9 kT.
+const BOLTZMANN_FLOOR: f64 = 1e-4;
 
 // ---------------------------------------------------------------------------
 // MeshLevel
@@ -49,9 +53,9 @@ pub struct MeshLevel {
     pub weights: Vec<f64>,
     /// Neighbor indices per vertex (BFS-reordered).
     pub neighbors: Vec<Vec<u16>>,
-    /// Lazy O(1) vertex locator.
+    /// Lazy O(1) face/vertex locator.
     #[serde(skip, default)]
-    locator: OnceLock<VertexLocator>,
+    locator: OnceLock<FaceGrid>,
 }
 
 impl MeshLevel {
@@ -95,21 +99,20 @@ impl MeshLevel {
         }
     }
 
-    /// Get or lazily initialize the vertex locator.
-    fn locator(&self) -> &VertexLocator {
+    /// Get or lazily initialize the face grid.
+    fn grid(&self) -> &FaceGrid {
         self.locator
-            .get_or_init(|| VertexLocator::new(&self.vertices))
+            .get_or_init(|| FaceGrid::new(&self.vertices, &self.neighbors))
     }
 
     /// Find the containing face and barycentric coordinates for a direction.
     pub fn find_face_bary(&self, dir: &Vector3) -> (Face, [f64; 3]) {
-        self.locator()
-            .find_face_bary(dir, &self.vertices, &self.neighbors)
+        self.grid().find_face_bary(dir)
     }
 
     /// Find the nearest vertex index for a direction (no triangle search).
     fn find_nearest_vertex(&self, dir: &Vector3) -> usize {
-        self.locator().find_nearest_vertex(dir, &self.vertices)
+        self.grid().find_nearest_vertex(dir)
     }
 }
 
@@ -127,7 +130,7 @@ impl MeshLevel {
 /// - **Mesh**: angular data stored on an icosphere. When the gradient is small,
 ///   nearest-vertex lookup (1 read) replaces barycentric interpolation (9 reads
 ///   + 9 FMAs), which also eliminates 9 exp() calls in the Boltzmann path.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum SlabResolution {
     /// Angular mesh with optional barycentric interpolation.
     Mesh {
@@ -502,9 +505,6 @@ impl AdaptiveBuilder {
         let lvl = &self.levels[level];
         let n_v = lvl.n_vertices;
         let scalar_threshold = self.gradient_threshold / 10.0;
-        // Slabs where exp(-βU) < this for all orientations are thermodynamically
-        // dead — MC will always reject. Corresponds to U > ~9 kT.
-        const BOLTZMANN_FLOOR: f64 = 1e-4;
         let mut max_gradient = 0.0f64;
         let mut has_nonrepulsive = false;
 
@@ -592,8 +592,357 @@ impl AdaptiveBuilder {
 }
 
 // ---------------------------------------------------------------------------
+// Table3DAdaptive
+// ---------------------------------------------------------------------------
+
+/// Adaptive 3D lookup table with per-R-slice resolution.
+///
+/// Each R-bin has a single slab (no dihedral angle dimension). Slab data
+/// is `n_v` values indexed by vertex. Supports the same tier classification
+/// as [`Table6DAdaptive`]: repulsive, scalar, nearest-vertex, and interpolated.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Table3DAdaptive<T: num_traits::Float> {
+    /// Minimum radial distance.
+    pub rmin: f64,
+    /// Maximum radial distance.
+    pub rmax: f64,
+    /// Radial bin width.
+    pub dr: f64,
+    /// Number of radial bins.
+    pub n_r: usize,
+    /// Pre-built mesh levels (indexed by `SlabResolution::Mesh::level`).
+    pub levels: Vec<MeshLevel>,
+    /// Resolution descriptor per R-bin.
+    pub slab_res: Vec<SlabResolution>,
+    /// Data offset per slab into `data`. `u32::MAX` for Scalar/Repulsive slabs.
+    pub(crate) slab_offsets: Vec<u32>,
+    /// Contiguous storage for all Mesh slab data.
+    pub data: Vec<T>,
+    /// Optional metadata for tail corrections beyond the table cutoff.
+    pub metadata: Option<TableMetadata>,
+}
+
+impl<T: num_traits::Float + Serialize + serde::de::DeserializeOwned> Table3DAdaptive<T> {
+    /// Save to a bincode file (gzip-compressed if path ends in `.gz`).
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        save_bincode(self, path.as_ref())
+    }
+
+    /// Load from a bincode file (gzip-decompressed if path ends in `.gz`).
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        load_bincode(path.as_ref())
+    }
+
+    /// Evaluate tail correction energy beyond the table cutoff.
+    pub fn tail_energy(&self, r: f64) -> f64 {
+        self.metadata.as_ref().map_or(0.0, |m| m.tail_energy(r))
+    }
+
+    /// Validate that tail correction metadata is self-consistent.
+    pub fn validate_metadata(&self) -> Result<()> {
+        if let Some(m) = &self.metadata {
+            m.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl<T: num_traits::Float + Into<f64>> Table3DAdaptive<T> {
+    /// Resolve R to a slab index, or `None` if out of range.
+    fn resolve_slab_idx(&self, r: f64) -> Option<usize> {
+        if r < self.rmin || r > self.rmax {
+            return None;
+        }
+        let ri = ((r - self.rmin) / self.dr + 0.5) as usize;
+        Some(ri.min(self.n_r.saturating_sub(1)))
+    }
+
+    /// Return the value at the nearest vertex (no interpolation).
+    fn nearest_vertex_val(&self, slab_idx: usize, level: u8, dir: &Vector3) -> f64 {
+        let lvl = &self.levels[level as usize];
+        let va = lvl.find_nearest_vertex(dir);
+        let base = self.slab_offsets[slab_idx] as usize;
+        self.data[base + va].into()
+    }
+
+    /// Gather the 3 interpolation values for a Mesh slab.
+    fn gather_mesh_vals(
+        &self,
+        slab_idx: usize,
+        level: u8,
+        dir: &Vector3,
+    ) -> (Face, [f64; 3], [f64; 3]) {
+        let lvl = &self.levels[level as usize];
+        let (face, bary) = lvl.find_face_bary(dir);
+        let base = self.slab_offsets[slab_idx] as usize;
+        let vals = [
+            self.data[base + face[0]].into(),
+            self.data[base + face[1]].into(),
+            self.data[base + face[2]].into(),
+        ];
+        (face, bary, vals)
+    }
+
+    /// Lookup value by nearest R bin with adaptive angular resolution.
+    pub fn lookup(&self, r: f64, dir: &Vector3) -> f64 {
+        let Some(slab_idx) = self.resolve_slab_idx(r) else {
+            return 0.0;
+        };
+        match &self.slab_res[slab_idx] {
+            SlabResolution::Scalar(v) => *v as f64,
+            SlabResolution::Repulsive => f64::INFINITY,
+            SlabResolution::Mesh {
+                level,
+                interpolate: false,
+            } => self.nearest_vertex_val(slab_idx, *level, dir),
+            SlabResolution::Mesh {
+                level,
+                interpolate: true,
+            } => {
+                let (_, bary, vals) = self.gather_mesh_vals(slab_idx, *level, dir);
+                bary[0] * vals[0] + bary[1] * vals[1] + bary[2] * vals[2]
+            }
+        }
+    }
+
+    /// Boltzmann-weighted interpolation: interpolate exp(-beta*u) then invert.
+    pub fn lookup_boltzmann(&self, r: f64, dir: &Vector3, beta: f64) -> f64 {
+        debug_assert!(beta > 0.0, "beta must be positive, got {beta}");
+        let Some(slab_idx) = self.resolve_slab_idx(r) else {
+            return 0.0;
+        };
+        match &self.slab_res[slab_idx] {
+            SlabResolution::Scalar(v) => *v as f64,
+            SlabResolution::Repulsive => f64::INFINITY,
+            SlabResolution::Mesh {
+                level,
+                interpolate: false,
+            } => self.nearest_vertex_val(slab_idx, *level, dir),
+            SlabResolution::Mesh {
+                level,
+                interpolate: true,
+            } => {
+                let (_, bary, vals) = self.gather_mesh_vals(slab_idx, *level, dir);
+                let u_min = vals[0].min(vals[1]).min(vals[2]);
+                if u_min.is_infinite() {
+                    return f64::INFINITY;
+                }
+                let sum = bary[0] * (-beta * (vals[0] - u_min)).exp()
+                    + bary[1] * (-beta * (vals[1] - u_min)).exp()
+                    + bary[2] * (-beta * (vals[2] - u_min)).exp();
+                if sum <= 0.0 {
+                    return f64::INFINITY;
+                }
+                u_min - sum.ln() / beta
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive3DBuilder
+// ---------------------------------------------------------------------------
+
+/// Drives the adaptive 3D table generation protocol.
+///
+/// Mirrors [`AdaptiveBuilder`] without the dihedral angle dimension: each
+/// R-slice has a single slab of `n_v` energies (not `n_v × n_v`).
+pub struct Adaptive3DBuilder {
+    rmin: f64,
+    dr: f64,
+    n_r: usize,
+    gradient_threshold: f64,
+    beta: f64,
+    levels: Vec<MeshLevel>,
+    current_level: usize,
+    slab_res: Vec<SlabResolution>,
+    slab_data: Vec<Option<Vec<f64>>>,
+}
+
+impl Adaptive3DBuilder {
+    /// Create a new adaptive 3D builder.
+    ///
+    /// # Arguments
+    /// * `rmin` — Minimum radial distance
+    /// * `rmax` — Maximum radial distance
+    /// * `dr` — Radial bin width
+    /// * `max_n_div` — Maximum icosphere subdivision level
+    /// * `gradient_threshold` — Angular gradient threshold for resolution reduction
+    /// * `beta` — Inverse thermal energy 1/kT (mol/kJ) for Boltzmann-weight
+    ///   based repulsive slab detection
+    pub fn new(
+        rmin: f64,
+        rmax: f64,
+        dr: f64,
+        max_n_div: usize,
+        gradient_threshold: f64,
+        beta: f64,
+    ) -> Self {
+        let n_r = ((rmax - rmin) / dr + 0.5) as usize;
+        let levels: Vec<MeshLevel> = (0..=max_n_div).map(MeshLevel::new).collect();
+
+        Self {
+            rmin,
+            dr,
+            n_r,
+            gradient_threshold,
+            beta,
+            current_level: levels.len() - 1,
+            levels,
+            slab_res: vec![SlabResolution::Scalar(0.0); n_r],
+            slab_data: vec![None; n_r],
+        }
+    }
+
+    /// Current subdivision level index (into `levels`).
+    pub const fn current_level(&self) -> usize {
+        self.current_level
+    }
+
+    /// Current n_div value.
+    pub fn current_n_div(&self) -> usize {
+        self.levels[self.current_level].n_div
+    }
+
+    /// Number of vertices at the current level.
+    pub fn current_n_vertices(&self) -> usize {
+        self.levels[self.current_level].n_vertices
+    }
+
+    /// Vertex directions at the given level index.
+    pub fn vertex_directions(&self, level: usize) -> &[[f64; 3]] {
+        &self.levels[level].vertices
+    }
+
+    /// Quadrature weights at the given level index.
+    pub fn vertex_weights(&self, level: usize) -> &[f64] {
+        &self.levels[level].weights
+    }
+
+    /// Number of radial bins.
+    pub const fn n_r(&self) -> usize {
+        self.n_r
+    }
+
+    /// The R value for a given radial index.
+    pub fn r_value(&self, ri: usize) -> f64 {
+        (ri as f64).mul_add(self.dr, self.rmin)
+    }
+
+    /// Set energy data for one R-bin.
+    ///
+    /// `energies` must have `n_v` elements where `n_v` is the vertex count
+    /// at the current level.
+    pub fn set_slab(&mut self, ri: usize, energies: &[f64]) {
+        let n_v = self.levels[self.current_level].n_vertices;
+        assert_eq!(
+            energies.len(),
+            n_v,
+            "expected {} energies, got {}",
+            n_v,
+            energies.len()
+        );
+        self.slab_data[ri] = Some(energies.to_vec());
+        self.slab_res[ri] = SlabResolution::Mesh {
+            level: self.current_level as u8,
+            interpolate: true,
+        };
+    }
+
+    /// Finish an R slice: classify the slab and possibly lower resolution.
+    ///
+    /// Returns the angular gradient (kJ/mol/rad) for the slab.
+    pub fn finish_r_slice(&mut self, ri: usize) -> f64 {
+        let level = self.current_level;
+        let lvl = &self.levels[level];
+        let scalar_threshold = self.gradient_threshold / 10.0;
+
+        let Some(ref data) = self.slab_data[ri] else {
+            return 0.0;
+        };
+
+        if data
+            .iter()
+            .all(|&e| (-self.beta * e).exp_m1() < BOLTZMANN_FLOOR - 1.0)
+        {
+            self.slab_res[ri] = SlabResolution::Repulsive;
+            self.slab_data[ri] = None;
+            return 0.0;
+        }
+
+        let grad = compute_gradient_1d(data, &lvl.vertices, &lvl.neighbors);
+
+        if grad < scalar_threshold {
+            let mean = data.iter().sum::<f64>() / data.len() as f64;
+            self.slab_res[ri] = SlabResolution::Scalar(mean as f32);
+            self.slab_data[ri] = None;
+        } else if grad < self.gradient_threshold {
+            self.slab_res[ri] = SlabResolution::Mesh {
+                level: level as u8,
+                interpolate: false,
+            };
+        }
+
+        if grad < self.gradient_threshold && self.current_level > 0 {
+            self.current_level -= 1;
+        }
+        grad
+    }
+
+    /// Build the final adaptive 3D table.
+    ///
+    /// Consumes the builder and produces a `Table3DAdaptive<f32>`.
+    pub fn build(self) -> Table3DAdaptive<f32> {
+        let mut slab_offsets = vec![u32::MAX; self.n_r];
+        let mut data = Vec::new();
+        let mut current_offset = 0u32;
+
+        for (ri, (res, slab_buf)) in self.slab_res.iter().zip(self.slab_data.iter()).enumerate() {
+            if let SlabResolution::Mesh { level, .. } = res {
+                slab_offsets[ri] = current_offset;
+                let n_v = self.levels[*level as usize].n_vertices;
+                let slab_data = slab_buf.as_ref().expect("Mesh slab must have data");
+                data.extend(slab_data.iter().map(|&v| v as f32));
+                current_offset += n_v as u32;
+            }
+        }
+
+        Table3DAdaptive {
+            rmin: self.rmin,
+            rmax: (self.n_r as f64).mul_add(self.dr, self.rmin),
+            dr: self.dr,
+            n_r: self.n_r,
+            levels: self.levels,
+            slab_res: self.slab_res,
+            slab_offsets,
+            data,
+            metadata: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gradient computation
 // ---------------------------------------------------------------------------
+
+/// Compute the max angular gradient for a 1D (single-direction) slab.
+///
+/// For each vertex `vi`, checks max |E(vi) - E(ni)| / angle(vi, ni) over neighbors.
+fn compute_gradient_1d(data: &[f64], vertices: &[[f64; 3]], neighbors: &[Vec<u16>]) -> f64 {
+    let mut max_grad = 0.0f64;
+    for (vi, &e_vi) in data.iter().enumerate() {
+        let va = Vector3::from(vertices[vi]);
+        for &ni in &neighbors[vi] {
+            let ni = ni as usize;
+            let angle = va.angle(&Vector3::from(vertices[ni]));
+            if angle > 1e-12 {
+                let grad = (e_vi - data[ni]).abs() / angle;
+                max_grad = max_grad.max(grad);
+            }
+        }
+    }
+    max_grad
+}
 
 /// Compute the max angular gradient for a slab.
 ///
@@ -1104,6 +1453,218 @@ mod tests {
             "Repulsive table ({}) should use less storage than full table ({})",
             table_rep.data.len(),
             table_full.data.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Table3DAdaptive / Adaptive3DBuilder tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gradient_1d_constant_surface() {
+        let lvl = MeshLevel::new(1);
+        let data = vec![42.0; lvl.n_vertices];
+        let grad = compute_gradient_1d(&data, &lvl.vertices, &lvl.neighbors);
+        assert_relative_eq!(grad, 0.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn gradient_1d_nonzero_surface() {
+        let lvl = MeshLevel::new(1);
+        let reference = Vector3::new(1.0, 1.0, 1.0).normalize();
+        let data: Vec<f64> = lvl
+            .vertices
+            .iter()
+            .map(|v| Vector3::from(*v).dot(&reference))
+            .collect();
+        let grad = compute_gradient_1d(&data, &lvl.vertices, &lvl.neighbors);
+        assert!(grad > 0.0);
+    }
+
+    #[test]
+    fn builder_3d_constant_becomes_scalar() {
+        let mut builder = Adaptive3DBuilder::new(5.0, 10.0, 1.0, 2, 1.0, 0.001);
+        for ri in 0..builder.n_r() {
+            let n_v = builder.current_n_vertices();
+            builder.set_slab(ri, &vec![42.0; n_v]);
+            builder.finish_r_slice(ri);
+        }
+        let table = builder.build();
+        for sr in &table.slab_res {
+            match sr {
+                SlabResolution::Scalar(v) => assert_relative_eq!(*v as f64, 42.0, epsilon = 1e-4),
+                _ => panic!("expected scalar for constant data"),
+            }
+        }
+        assert!(table.data.is_empty());
+    }
+
+    #[test]
+    fn builder_3d_varying_becomes_mesh() {
+        let mut builder = Adaptive3DBuilder::new(5.0, 7.0, 1.0, 1, 1e10, 0.001);
+        let reference = Vector3::new(1.0, 0.0, 0.0);
+        for ri in 0..builder.n_r() {
+            let verts = builder.vertex_directions(builder.current_level()).to_vec();
+            let data: Vec<f64> = verts
+                .iter()
+                .map(|v| 10.0 * Vector3::from(*v).dot(&reference))
+                .collect();
+            builder.set_slab(ri, &data);
+            builder.finish_r_slice(ri);
+        }
+        let table = builder.build();
+        let dir = Vector3::new(1.0, 0.0, 0.0);
+        let val = table.lookup(5.5, &dir);
+        assert!(val.is_finite(), "lookup returned {val}");
+    }
+
+    #[test]
+    fn builder_3d_repulsive() {
+        let mut builder = Adaptive3DBuilder::new(5.0, 7.0, 1.0, 1, 1e10, 1.0);
+        let n_v = builder.current_n_vertices();
+        // ri=0: strongly repulsive
+        builder.set_slab(0, &vec![200.0; n_v]);
+        builder.finish_r_slice(0);
+        // ri=1: moderate
+        let n_v = builder.current_n_vertices();
+        builder.set_slab(1, &vec![5.0; n_v]);
+        builder.finish_r_slice(1);
+
+        let table = builder.build();
+        let dir = Vector3::new(1.0, 0.0, 0.0);
+        assert!(table.lookup(5.0, &dir).is_infinite());
+        let e = table.lookup(6.0, &dir);
+        assert!((e - 5.0).abs() < 0.1, "Expected ~5, got {e}");
+    }
+
+    #[test]
+    fn builder_3d_no_interpolation_for_smooth() {
+        let lvl = MeshLevel::new(1);
+        let reference = Vector3::new(1.0, 0.0, 0.0);
+        let test_data: Vec<f64> = lvl
+            .vertices
+            .iter()
+            .map(|v| 10.0 + 0.1 * Vector3::from(*v).dot(&reference))
+            .collect();
+        let grad = compute_gradient_1d(&test_data, &lvl.vertices, &lvl.neighbors);
+        let gradient_threshold = grad * 2.0;
+        assert!(grad > gradient_threshold / 10.0);
+
+        let mut builder = Adaptive3DBuilder::new(5.0, 7.0, 1.0, 1, gradient_threshold, 0.001);
+        let verts = builder.vertex_directions(builder.current_level()).to_vec();
+        let data: Vec<f64> = verts
+            .iter()
+            .map(|v| 10.0 + 0.1 * Vector3::from(*v).dot(&reference))
+            .collect();
+        builder.set_slab(0, &data);
+        builder.finish_r_slice(0);
+
+        assert!(matches!(
+            builder.slab_res[0],
+            SlabResolution::Mesh {
+                interpolate: false,
+                ..
+            }
+        ));
+
+        let n_v = builder.current_n_vertices();
+        builder.set_slab(1, &vec![10.0; n_v]);
+        builder.finish_r_slice(1);
+        let table = builder.build();
+        let dir = Vector3::new(1.0, 0.0, 0.0);
+        let e = table.lookup(5.0, &dir);
+        assert!(e.is_finite());
+    }
+
+    #[test]
+    fn lookup_3d_constant() {
+        let mut builder = Adaptive3DBuilder::new(5.0, 10.0, 1.0, 2, 1e10, 0.001);
+        for ri in 0..builder.n_r() {
+            let n_v = builder.current_n_vertices();
+            builder.set_slab(ri, &vec![42.0; n_v]);
+            builder.finish_r_slice(ri);
+        }
+        let table = builder.build();
+        let dir = Vector3::new(1.0, 0.0, 0.0);
+        let e = table.lookup(7.0, &dir);
+        assert!(
+            (e - 42.0).abs() < 0.1,
+            "Expected ~42 for constant table, got {e}"
+        );
+    }
+
+    #[test]
+    fn lookup_3d_out_of_range() {
+        let mut builder = Adaptive3DBuilder::new(5.0, 10.0, 1.0, 1, 1e10, 0.001);
+        for ri in 0..builder.n_r() {
+            let n_v = builder.current_n_vertices();
+            builder.set_slab(ri, &vec![1.0; n_v]);
+            builder.finish_r_slice(ri);
+        }
+        let table = builder.build();
+        let dir = Vector3::new(1.0, 0.0, 0.0);
+        assert_eq!(table.lookup(3.0, &dir), 0.0);
+        assert_eq!(table.lookup(20.0, &dir), 0.0);
+    }
+
+    #[test]
+    fn boltzmann_3d_constant() {
+        let mut builder = Adaptive3DBuilder::new(5.0, 10.0, 1.0, 2, 1e10, 0.001);
+        for ri in 0..builder.n_r() {
+            let n_v = builder.current_n_vertices();
+            builder.set_slab(ri, &vec![42.0; n_v]);
+            builder.finish_r_slice(ri);
+        }
+        let table = builder.build();
+        let dir = Vector3::new(1.0, 0.0, 0.0);
+        let e = table.lookup_boltzmann(7.0, &dir, 1.0);
+        assert!(
+            (e - 42.0).abs() < 0.1,
+            "Expected ~42 for constant Boltzmann, got {e}"
+        );
+    }
+
+    #[test]
+    fn adaptive_3d_resolution_decreases() {
+        let mut builder = Adaptive3DBuilder::new(5.0, 10.0, 1.0, 3, 1e10, 0.001);
+        assert_eq!(builder.current_n_div(), 3);
+
+        let n_v = builder.current_n_vertices();
+        builder.set_slab(0, &vec![42.0; n_v]);
+        builder.finish_r_slice(0);
+        assert!(builder.current_n_div() < 3);
+
+        let n_v = builder.current_n_vertices();
+        builder.set_slab(1, &vec![42.0; n_v]);
+        builder.finish_r_slice(1);
+        assert!(builder.current_n_div() < 2);
+    }
+
+    #[test]
+    fn round_trip_3d_save_load() {
+        let mut builder = Adaptive3DBuilder::new(5.0, 8.0, 1.0, 1, 1e10, 0.001);
+        for ri in 0..builder.n_r() {
+            let n_v = builder.current_n_vertices();
+            builder.set_slab(ri, &vec![7.0; n_v]);
+            builder.finish_r_slice(ri);
+        }
+        let table = builder.build();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adaptive3d.bin.gz");
+        table.save(&path).unwrap();
+        let loaded = Table3DAdaptive::<f32>::load(&path).unwrap();
+
+        assert_eq!(loaded.n_r, table.n_r);
+        assert_eq!(loaded.data.len(), table.data.len());
+        assert_eq!(loaded.slab_res.len(), table.slab_res.len());
+
+        let d = Vector3::new(1.0, 0.0, 0.0);
+        let orig = table.lookup(6.0, &d);
+        let load = loaded.lookup(6.0, &d);
+        assert!(
+            (orig - load).abs() < 1e-4,
+            "Round-trip mismatch: {orig} vs {load}"
         );
     }
 }
