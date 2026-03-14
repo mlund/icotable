@@ -258,6 +258,30 @@ pub struct TableMetadata {
     pub electric_prefactor: Option<f64>,
 }
 
+impl TableMetadata {
+    /// Evaluate tail correction energy at distance `r`.
+    pub fn tail_energy(&self, r: f64) -> f64 {
+        if self.tail_terms.is_empty() {
+            return 0.0;
+        }
+        let prefactor = self.electric_prefactor.unwrap_or(0.0);
+        prefactor
+            * self
+                .tail_terms
+                .iter()
+                .map(|t| t.coefficient * (-t.kappa * r).exp() / r.powi(t.power as i32))
+                .sum::<f64>()
+    }
+
+    /// Validate that tail correction metadata is self-consistent.
+    pub fn validate(&self) -> Result<()> {
+        if !self.tail_terms.is_empty() && self.electric_prefactor.is_none() {
+            anyhow::bail!("tail correction terms present but electric_prefactor is missing");
+        }
+        Ok(())
+    }
+}
+
 /// Flat, serializable 6D lookup table.
 ///
 /// Layout: `data[r_idx * (n_omega * n_v * n_v) + omega_idx * (n_v * n_v) + vi * n_v + vj]`
@@ -346,27 +370,14 @@ impl<T: num_traits::Float + Serialize + DeserializeOwned> Table6DFlat<T> {
     /// Evaluate tail correction energy beyond the table cutoff.
     ///
     /// Returns 0 if no tail terms or no electric prefactor is present.
-    /// Missing prefactor with non-empty terms is a table-generation bug;
-    /// callers should validate at load time, not on every energy evaluation.
     pub fn tail_energy(&self, r: f64) -> f64 {
-        let m = match self.metadata.as_ref() {
-            Some(m) if !m.tail_terms.is_empty() => m,
-            _ => return 0.0,
-        };
-        let prefactor = m.electric_prefactor.unwrap_or(0.0);
-        prefactor
-            * m.tail_terms
-                .iter()
-                .map(|t| t.coefficient * (-t.kappa * r).exp() / r.powi(t.power as i32))
-                .sum::<f64>()
+        self.metadata.as_ref().map_or(0.0, |m| m.tail_energy(r))
     }
 
     /// Validate that tail correction metadata is self-consistent.
     pub fn validate_metadata(&self) -> Result<()> {
         if let Some(m) = &self.metadata {
-            if !m.tail_terms.is_empty() && m.electric_prefactor.is_none() {
-                anyhow::bail!("tail correction terms present but electric_prefactor is missing");
-            }
+            m.validate()?;
         }
         Ok(())
     }

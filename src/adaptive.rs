@@ -1,20 +1,28 @@
 //! Adaptive 6D tables with per-R-slice resolution.
 //!
 //! [`Table6DAdaptive`] stores angular data at varying icosphere resolutions
-//! across radial slices. Slices where the angular surface is smooth use fewer
-//! vertices (or a single scalar), saving both generation time and memory.
+//! across radial slices. Each (R, ω) slab is classified into one of four tiers
+//! based on angular gradients and Boltzmann weights:
 //!
-//! [`AdaptiveBuilder`] drives the coarse→fine evaluation protocol: it provides
-//! vertex directions per resolution level, accepts batched energy results, and
-//! automatically decides when to lower the resolution for subsequent R slices.
+//! - **Repulsive** — all `exp(−βU) < 10⁻⁴`; zero storage, lookup returns ∞.
+//! - **Scalar** — nearly isotropic; single mean value.
+//! - **Nearest-vertex** — smooth surface; lookup without interpolation.
+//! - **Interpolated** — full barycentric interpolation on icosphere faces.
+//!
+//! [`AdaptiveBuilder`] drives the table generation protocol: it provides
+//! vertex directions and quadrature weights per resolution level, accepts
+//! batched energy results, and classifies slabs after each R-slice.
+//! The repulsive classification uses `β = 1/kT` from the generation
+//! temperature, making the table temperature-dependent.
 
 use crate::flat::{
-    apply_vertex_permutation, bfs_vertex_permutation, load_bincode, save_bincode, VertexLocator,
+    apply_vertex_permutation, bfs_vertex_permutation, load_bincode, save_bincode, TableMetadata,
+    VertexLocator,
 };
 use crate::ico::Face;
-use crate::make_icosphere_by_ndiv;
 use crate::vertex::make_vertices;
 use crate::Vector3;
+use crate::{make_icosphere_by_ndiv, make_weights};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -34,6 +42,11 @@ pub struct MeshLevel {
     pub n_vertices: usize,
     /// BFS-reordered vertex positions `[x, y, z]` on unit sphere.
     pub vertices: Vec<[f64; 3]>,
+    /// Quadrature weights per vertex (Voronoi solid-angle fractions, normalized
+    /// so that uniform weight = 1.0). BFS-reordered to match `vertices`.
+    /// Needed for correct angular integration: icosphere vertices do not subtend
+    /// exactly equal solid angles (12 pentagonal vs. remaining hexagonal cells).
+    pub weights: Vec<f64>,
     /// Neighbor indices per vertex (BFS-reordered).
     pub neighbors: Vec<Vec<u16>>,
     /// Lazy O(1) vertex locator.
@@ -48,6 +61,7 @@ impl MeshLevel {
         let verts = make_vertices(&ico);
         let n_vertices = verts.len();
 
+        let weights = make_weights(&ico);
         let mut vertices: Vec<[f64; 3]> = verts
             .iter()
             .map(|v| {
@@ -68,11 +82,14 @@ impl MeshLevel {
             n_vertices,
             1,
         );
+        // Apply same BFS permutation to weights
+        let weights: Vec<f64> = perm.iter().map(|&old_idx| weights[old_idx]).collect();
 
         Self {
             n_div,
             n_vertices,
             vertices,
+            weights,
             neighbors,
             locator: OnceLock::new(),
         }
@@ -96,15 +113,30 @@ impl MeshLevel {
 // ---------------------------------------------------------------------------
 
 /// Resolution for a single (R, ω) slab.
+///
+/// Three tiers reduce storage and lookup cost for regions of the 6D energy
+/// surface where full angular resolution is unnecessary:
+/// - **Repulsive**: overlapping configurations where exp(−βu) ≈ 0; MC always
+///   rejects, so the exact energy is irrelevant. Zero storage.
+/// - **Scalar**: nearly isotropic slabs collapsed to a single mean value.
+/// - **Mesh**: angular data stored on an icosphere. When the gradient is small,
+///   nearest-vertex lookup (1 read) replaces barycentric interpolation (9 reads
+///   + 9 FMAs), which also eliminates 9 exp() calls in the Boltzmann path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SlabResolution {
-    /// Full angular mesh at the given level index into `Table6DAdaptive::levels`.
+    /// Angular mesh with optional barycentric interpolation.
     Mesh {
         /// Index into `Table6DAdaptive::levels`.
         level: u8,
+        /// When `false`, lookup returns the nearest-vertex value (1 read)
+        /// instead of full barycentric interpolation (9 reads + 9 FMAs).
+        interpolate: bool,
     },
     /// Fully isotropic: single scalar value (no angular dependence).
     Scalar(f32),
+    /// All orientations are strongly repulsive (above energy threshold).
+    /// Stores nothing; lookup returns infinity.
+    Repulsive,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,11 +166,13 @@ pub struct Table6DAdaptive<T: num_traits::Float> {
     pub levels: Vec<MeshLevel>,
     /// Resolution descriptor per (R, ω) slab. Layout: `slab_res[ri * n_omega + oi]`.
     pub slab_res: Vec<SlabResolution>,
-    /// Data offset per slab into `data`. `u32::MAX` for Scalar slabs.
+    /// Data offset per slab into `data`. `u32::MAX` for Scalar/Repulsive slabs.
     /// Indexed directly by slab_idx for O(1) lookup (not by mesh-ordinal).
     pub(crate) slab_offsets: Vec<u32>,
     /// Contiguous storage for all Mesh slab data.
     pub data: Vec<T>,
+    /// Optional metadata for tail corrections beyond the table cutoff.
+    pub metadata: Option<TableMetadata>,
 }
 
 impl<T: num_traits::Float + Serialize + serde::de::DeserializeOwned> Table6DAdaptive<T> {
@@ -150,6 +184,21 @@ impl<T: num_traits::Float + Serialize + serde::de::DeserializeOwned> Table6DAdap
     /// Load from a bincode file (gzip-decompressed if path ends in `.gz`).
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         load_bincode(path.as_ref())
+    }
+
+    /// Evaluate tail correction energy beyond the table cutoff.
+    ///
+    /// Returns 0 if no tail terms or no electric prefactor is present.
+    pub fn tail_energy(&self, r: f64) -> f64 {
+        self.metadata.as_ref().map_or(0.0, |m| m.tail_energy(r))
+    }
+
+    /// Validate that tail correction metadata is self-consistent.
+    pub fn validate_metadata(&self) -> Result<()> {
+        if let Some(m) = &self.metadata {
+            m.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -192,6 +241,24 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
         (face_a, bary_a, face_b, bary_b, vals)
     }
 
+    /// Return the value at the nearest vertex pair (no interpolation).
+    fn nearest_vertex_val(
+        &self,
+        slab_idx: usize,
+        level: u8,
+        dir_a: &Vector3,
+        dir_b: &Vector3,
+    ) -> f64 {
+        let lvl = &self.levels[level as usize];
+        let n_v = lvl.n_vertices;
+        let (face_a, bary_a) = lvl.find_face_bary(dir_a);
+        let (face_b, bary_b) = lvl.find_face_bary(dir_b);
+        let ia = argmax3(&bary_a);
+        let ib = argmax3(&bary_b);
+        let base = self.slab_offsets[slab_idx] as usize;
+        self.data[base + face_a[ia] * n_v + face_b[ib]].into()
+    }
+
     /// Lookup value by nearest R/ω bin with adaptive angular resolution.
     pub fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3) -> f64 {
         let Some(slab_idx) = self.resolve_slab_idx(r, omega) else {
@@ -199,7 +266,15 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
         };
         match &self.slab_res[slab_idx] {
             SlabResolution::Scalar(v) => *v as f64,
-            SlabResolution::Mesh { level } => {
+            SlabResolution::Repulsive => f64::INFINITY,
+            SlabResolution::Mesh {
+                level,
+                interpolate: false,
+            } => self.nearest_vertex_val(slab_idx, *level, dir_a, dir_b),
+            SlabResolution::Mesh {
+                level,
+                interpolate: true,
+            } => {
                 let (_, bary_a, _, bary_b, vals) =
                     self.gather_mesh_vals(slab_idx, *level, dir_a, dir_b);
                 let mut result = 0.0;
@@ -228,7 +303,15 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
         };
         match &self.slab_res[slab_idx] {
             SlabResolution::Scalar(v) => *v as f64,
-            SlabResolution::Mesh { level } => {
+            SlabResolution::Repulsive => f64::INFINITY,
+            SlabResolution::Mesh {
+                level,
+                interpolate: false,
+            } => self.nearest_vertex_val(slab_idx, *level, dir_a, dir_b),
+            SlabResolution::Mesh {
+                level,
+                interpolate: true,
+            } => {
                 let (_, bary_a, _, bary_b, vals) =
                     self.gather_mesh_vals(slab_idx, *level, dir_a, dir_b);
 
@@ -271,6 +354,10 @@ pub struct AdaptiveBuilder {
     n_omega: usize,
     omega_step: f64,
     gradient_threshold: f64,
+    /// Inverse thermal energy 1/kT (mol/kJ). Used to test whether all
+    /// Boltzmann weights in a slab are negligible (expm1(-βU) ≈ −1),
+    /// replacing the old energy-based repulsive threshold.
+    beta: f64,
     levels: Vec<MeshLevel>,
     /// Current n_div index into `levels`. Monotonically decreases.
     current_level: usize,
@@ -290,6 +377,8 @@ impl AdaptiveBuilder {
     /// * `omega_step` — Dihedral angle bin width (radians)
     /// * `max_n_div` — Maximum icosphere subdivision level
     /// * `gradient_threshold` — Angular gradient threshold for resolution reduction
+    /// * `beta` — Inverse thermal energy 1/kT (mol/kJ) for Boltzmann-weight
+    ///   based repulsive slab detection
     pub fn new(
         rmin: f64,
         rmax: f64,
@@ -297,6 +386,7 @@ impl AdaptiveBuilder {
         omega_step: f64,
         max_n_div: usize,
         gradient_threshold: f64,
+        beta: f64,
     ) -> Self {
         let n_r = ((rmax - rmin) / dr + 0.5) as usize;
         let n_omega = (std::f64::consts::TAU / omega_step + 0.5) as usize;
@@ -312,6 +402,7 @@ impl AdaptiveBuilder {
             n_omega,
             omega_step,
             gradient_threshold,
+            beta,
             current_level: levels.len() - 1, // start at max
             levels,
             slab_res: vec![SlabResolution::Scalar(0.0); n_slabs],
@@ -337,6 +428,14 @@ impl AdaptiveBuilder {
     /// Vertex directions at the given level index.
     pub fn vertex_directions(&self, level: usize) -> &[[f64; 3]] {
         &self.levels[level].vertices
+    }
+
+    /// Quadrature weights at the given level index.
+    ///
+    /// Normalized so uniform weight = 1.0; the product `w_i * w_j` gives
+    /// the relative solid-angle degeneracy for vertex pair (i, j).
+    pub fn vertex_weights(&self, level: usize) -> &[f64] {
+        &self.levels[level].weights
     }
 
     /// Number of radial bins.
@@ -376,48 +475,75 @@ impl AdaptiveBuilder {
         self.slab_data[slab_idx] = Some(energies.to_vec());
         self.slab_res[slab_idx] = SlabResolution::Mesh {
             level: self.current_level as u8,
+            interpolate: true,
         };
     }
 
-    /// Finish an R slice: check gradients and possibly lower resolution for the next R.
+    /// Finish an R slice: classify each slab and possibly lower resolution for the next R.
+    ///
+    /// Per-slab classification (checked in order):
+    /// 1. **Repulsive** — all Boltzmann weights negligible (expm1(−βU) ≈ −1) → zero storage.
+    /// 2. **Scalar** — angular gradient < `gradient_threshold / 10` → 4-byte mean.
+    /// 3. **Mesh (no interpolation)** — gradient < `gradient_threshold` → nearest-vertex lookup.
+    /// 4. **Mesh (interpolated)** — full barycentric interpolation.
+    ///
+    /// Returns the maximum angular gradient (kJ/mol/rad) across all non-repulsive slabs.
     ///
     /// Call this after all ω slabs for a given `ri` have been set.
-    pub fn finish_r_slice(&mut self, ri: usize) {
+    pub fn finish_r_slice(&mut self, ri: usize) -> f64 {
         let level = self.current_level;
         let lvl = &self.levels[level];
         let n_v = lvl.n_vertices;
-
-        // Compute max gradient across all omega slabs for this R
+        let scalar_threshold = self.gradient_threshold / 10.0;
+        // Slabs where exp(-βU) < this for all orientations are thermodynamically
+        // dead — MC will always reject. Corresponds to U > ~9 kT.
+        const BOLTZMANN_FLOOR: f64 = 1e-4;
         let mut max_gradient = 0.0f64;
-        // Slabs with gradient < threshold/100 are nearly isotropic and can be
-        // collapsed to a single scalar, skipping angular interpolation at lookup.
-        let scalar_threshold = self.gradient_threshold / 100.0;
+        let mut has_nonrepulsive = false;
 
         for oi in 0..self.n_omega {
             let slab_idx = ri * self.n_omega + oi;
-            if let Some(ref data) = self.slab_data[slab_idx] {
-                let grad = compute_gradient(data, &lvl.vertices, &lvl.neighbors, n_v);
+            let Some(ref data) = self.slab_data[slab_idx] else {
+                continue;
+            };
+
+            if data
+                .iter()
+                .all(|&e| (-self.beta * e).exp_m1() < BOLTZMANN_FLOOR - 1.0)
+            {
+                self.slab_res[slab_idx] = SlabResolution::Repulsive;
+                self.slab_data[slab_idx] = None;
+                continue;
+            }
+
+            has_nonrepulsive = true;
+            let grad = compute_gradient(data, &lvl.vertices, &lvl.neighbors, n_v);
+
+            if grad < scalar_threshold {
+                // 2. Scalar: nearly isotropic
+                let mean = data.iter().sum::<f64>() / data.len() as f64;
+                self.slab_res[slab_idx] = SlabResolution::Scalar(mean as f32);
+                self.slab_data[slab_idx] = None;
+            } else if grad < self.gradient_threshold {
+                // 3. Mesh without interpolation: smooth enough for nearest-vertex
+                self.slab_res[slab_idx] = SlabResolution::Mesh {
+                    level: level as u8,
+                    interpolate: false,
+                };
+                max_gradient = max_gradient.max(grad);
+            } else {
+                // 4. Mesh with full interpolation
                 max_gradient = max_gradient.max(grad);
             }
         }
 
-        // If gradient is very small, convert to scalar
-        if max_gradient < scalar_threshold {
-            for oi in 0..self.n_omega {
-                let slab_idx = ri * self.n_omega + oi;
-                if let Some(ref data) = self.slab_data[slab_idx] {
-                    let mean = data.iter().sum::<f64>() / data.len() as f64;
-                    self.slab_res[slab_idx] = SlabResolution::Scalar(mean as f32);
-                    self.slab_data[slab_idx] = None; // free memory
-                }
-            }
-        }
-
-        // Resolution monotonically decreases with R: once a coarser level suffices,
-        // all longer-range slices are at least as smooth (Coulomb/LJ decay).
-        if max_gradient < self.gradient_threshold && self.current_level > 0 {
+        // Only decrease resolution when we have gradient evidence from
+        // non-repulsive slabs. All-repulsive R-slices (short range) must
+        // not reduce the level — the binding region ahead may need it.
+        if has_nonrepulsive && max_gradient < self.gradient_threshold && self.current_level > 0 {
             self.current_level -= 1;
         }
+        max_gradient
     }
 
     /// Build the final adaptive table.
@@ -433,7 +559,7 @@ impl AdaptiveBuilder {
         for (slab_idx, (res, slab_buf)) in
             self.slab_res.iter().zip(self.slab_data.iter()).enumerate()
         {
-            if let SlabResolution::Mesh { level } = res {
+            if let SlabResolution::Mesh { level, .. } = res {
                 slab_offsets[slab_idx] = current_offset;
                 let n_v = self.levels[*level as usize].n_vertices;
                 let slab_data = slab_buf.as_ref().expect("Mesh slab must have data");
@@ -453,7 +579,19 @@ impl AdaptiveBuilder {
             slab_res: self.slab_res,
             slab_offsets,
             data,
+            metadata: None,
         }
+    }
+}
+
+/// Index of the largest element in a 3-element array.
+fn argmax3(v: &[f64; 3]) -> usize {
+    if v[0] >= v[1] && v[0] >= v[2] {
+        0
+    } else if v[1] >= v[2] {
+        1
+    } else {
+        2
     }
 }
 
@@ -586,7 +724,8 @@ mod tests {
 
     #[test]
     fn builder_all_constant_becomes_scalar() {
-        let mut builder = AdaptiveBuilder::new(5.0, 10.0, 1.0, std::f64::consts::TAU / 4.0, 2, 1.0);
+        let mut builder =
+            AdaptiveBuilder::new(5.0, 10.0, 1.0, std::f64::consts::TAU / 4.0, 2, 1.0, 0.001);
 
         for ri in 0..builder.n_r() {
             let n_v = builder.current_n_vertices();
@@ -602,7 +741,9 @@ mod tests {
         for sr in &table.slab_res {
             match sr {
                 SlabResolution::Scalar(v) => assert_relative_eq!(*v as f64, 42.0, epsilon = 1e-4),
-                SlabResolution::Mesh { .. } => panic!("expected scalar for constant data"),
+                SlabResolution::Mesh { .. } | SlabResolution::Repulsive => {
+                    panic!("expected scalar for constant data")
+                }
             }
         }
         // No mesh data
@@ -611,7 +752,8 @@ mod tests {
 
     #[test]
     fn builder_produces_mesh_for_nonconstant() {
-        let mut builder = AdaptiveBuilder::new(5.0, 7.0, 1.0, std::f64::consts::TAU / 4.0, 1, 1e10);
+        let mut builder =
+            AdaptiveBuilder::new(5.0, 7.0, 1.0, std::f64::consts::TAU / 4.0, 1, 1e10, 0.001);
 
         let reference = Vector3::new(1.0, 0.0, 0.0);
         for ri in 0..builder.n_r() {
@@ -644,7 +786,7 @@ mod tests {
     #[test]
     fn lookup_constant_adaptive() {
         let mut builder =
-            AdaptiveBuilder::new(5.0, 10.0, 1.0, std::f64::consts::TAU / 8.0, 2, 1e10);
+            AdaptiveBuilder::new(5.0, 10.0, 1.0, std::f64::consts::TAU / 8.0, 2, 1e10, 0.001);
 
         for ri in 0..builder.n_r() {
             let n_v = builder.current_n_vertices();
@@ -668,7 +810,7 @@ mod tests {
     #[test]
     fn lookup_out_of_range() {
         let mut builder =
-            AdaptiveBuilder::new(5.0, 10.0, 1.0, std::f64::consts::TAU / 4.0, 1, 1e10);
+            AdaptiveBuilder::new(5.0, 10.0, 1.0, std::f64::consts::TAU / 4.0, 1, 1e10, 0.001);
         for ri in 0..builder.n_r() {
             let n_v = builder.current_n_vertices();
             for oi in 0..builder.n_omega() {
@@ -685,7 +827,7 @@ mod tests {
     #[test]
     fn boltzmann_constant_adaptive() {
         let mut builder =
-            AdaptiveBuilder::new(5.0, 10.0, 1.0, std::f64::consts::TAU / 8.0, 2, 1e10);
+            AdaptiveBuilder::new(5.0, 10.0, 1.0, std::f64::consts::TAU / 8.0, 2, 1e10, 0.001);
         for ri in 0..builder.n_r() {
             let n_v = builder.current_n_vertices();
             for oi in 0..builder.n_omega() {
@@ -707,7 +849,7 @@ mod tests {
     fn adaptive_resolution_decreases() {
         // Use a high gradient threshold so the builder always wants to go coarser
         let mut builder =
-            AdaptiveBuilder::new(5.0, 10.0, 1.0, std::f64::consts::TAU / 4.0, 3, 1e10);
+            AdaptiveBuilder::new(5.0, 10.0, 1.0, std::f64::consts::TAU / 4.0, 3, 1e10, 0.001);
         assert_eq!(builder.current_n_div(), 3);
 
         let n_v = builder.current_n_vertices();
@@ -729,7 +871,8 @@ mod tests {
 
     #[test]
     fn round_trip_save_load() {
-        let mut builder = AdaptiveBuilder::new(5.0, 8.0, 1.0, std::f64::consts::TAU / 4.0, 1, 1e10);
+        let mut builder =
+            AdaptiveBuilder::new(5.0, 8.0, 1.0, std::f64::consts::TAU / 4.0, 1, 1e10, 0.001);
         for ri in 0..builder.n_r() {
             let n_v = builder.current_n_vertices();
             for oi in 0..builder.n_omega() {
@@ -762,7 +905,8 @@ mod tests {
     #[test]
     fn mixed_scalar_and_mesh_slabs() {
         // First R slice: non-constant → mesh, large threshold so second becomes scalar
-        let mut builder = AdaptiveBuilder::new(5.0, 7.0, 1.0, std::f64::consts::TAU / 2.0, 1, 1e10);
+        let mut builder =
+            AdaptiveBuilder::new(5.0, 7.0, 1.0, std::f64::consts::TAU / 2.0, 1, 1e10, 0.001);
         let n_v = builder.current_n_vertices();
         let verts = builder.vertex_directions(builder.current_level()).to_vec();
         let reference = Vector3::new(1.0, 0.0, 0.0);
@@ -796,5 +940,174 @@ mod tests {
         assert!(e1.is_finite());
         let e2 = table.lookup(6.5, 0.0, &dir_a, &dir_b);
         assert!(e2.is_finite());
+    }
+
+    #[test]
+    fn repulsive_slab_returns_infinity() {
+        // beta=1.0: energies of 200 give expm1(-200) ≈ -1 → repulsive
+        let mut builder =
+            AdaptiveBuilder::new(5.0, 7.0, 1.0, std::f64::consts::TAU / 4.0, 1, 1e10, 1.0);
+
+        let n_v = builder.current_n_vertices();
+        // ri=0 (R=5.0): all energies strongly repulsive (expm1(-βU) ≈ -1)
+        for oi in 0..builder.n_omega() {
+            builder.set_slab(0, oi, &vec![200.0; n_v * n_v]);
+        }
+        builder.finish_r_slice(0);
+
+        // ri=1 (R=6.0): moderate energies
+        let n_v = builder.current_n_vertices();
+        for oi in 0..builder.n_omega() {
+            builder.set_slab(1, oi, &vec![5.0; n_v * n_v]);
+        }
+        builder.finish_r_slice(1);
+
+        let table = builder.build();
+        let dir = Vector3::new(1.0, 0.0, 0.0);
+
+        // Repulsive slab (R=5.0 → ri=0) → infinity
+        assert!(table.lookup(5.0, 0.0, &dir, &dir).is_infinite());
+        assert!(table
+            .lookup_boltzmann(5.0, 0.0, &dir, &dir, 1.0)
+            .is_infinite());
+        // Non-repulsive slab (R=6.0 → ri=1) → finite
+        let e = table.lookup(6.0, 0.0, &dir, &dir);
+        assert!((e - 5.0).abs() < 0.1, "Expected ~5, got {e}");
+        // All ri=0 slabs should be Repulsive
+        for oi in 0..table.n_omega {
+            assert!(matches!(table.slab_res[oi], SlabResolution::Repulsive));
+        }
+    }
+
+    #[test]
+    fn no_interpolation_for_smooth_slab() {
+        let n_v_at_level1 = 42; // 10*(1+1)^2 + 2
+        let reference = Vector3::new(1.0, 0.0, 0.0);
+
+        // First, measure the actual gradient of our test data
+        let lvl = MeshLevel::new(1);
+        let mut test_data = vec![0.0; n_v_at_level1 * n_v_at_level1];
+        for vi in 0..n_v_at_level1 {
+            let va = Vector3::from(lvl.vertices[vi]);
+            for vj in 0..n_v_at_level1 {
+                let vb = Vector3::from(lvl.vertices[vj]);
+                test_data[vi * n_v_at_level1 + vj] =
+                    10.0 + 0.1 * va.dot(&reference) + 0.1 * vb.dot(&reference);
+            }
+        }
+        let grad = compute_gradient(&test_data, &lvl.vertices, &lvl.neighbors, n_v_at_level1);
+
+        // Set gradient_threshold just above the measured gradient so:
+        //   scalar_threshold = gradient_threshold/10 < grad < gradient_threshold
+        let gradient_threshold = grad * 2.0;
+        assert!(
+            grad > gradient_threshold / 10.0,
+            "Gradient {grad} should be above scalar threshold {}",
+            gradient_threshold / 10.0
+        );
+
+        let mut builder = AdaptiveBuilder::new(
+            5.0,
+            7.0,
+            1.0,
+            std::f64::consts::TAU / 4.0,
+            1,
+            gradient_threshold,
+            0.001,
+        );
+
+        let n_v = builder.current_n_vertices();
+        let verts = builder.vertex_directions(builder.current_level()).to_vec();
+
+        for oi in 0..builder.n_omega() {
+            let mut data = vec![0.0; n_v * n_v];
+            for vi in 0..n_v {
+                let va = Vector3::from(verts[vi]);
+                for vj in 0..n_v {
+                    let vb = Vector3::from(verts[vj]);
+                    data[vi * n_v + vj] =
+                        10.0 + 0.1 * va.dot(&reference) + 0.1 * vb.dot(&reference);
+                }
+            }
+            builder.set_slab(0, oi, &data);
+        }
+        builder.finish_r_slice(0);
+
+        let has_no_interp = (0..builder.n_omega()).any(|oi| {
+            matches!(
+                builder.slab_res[oi],
+                SlabResolution::Mesh {
+                    interpolate: false,
+                    ..
+                }
+            )
+        });
+        assert!(has_no_interp, "Expected non-interpolated mesh slabs");
+
+        // Fill remaining R slice
+        let n_v = builder.current_n_vertices();
+        for oi in 0..builder.n_omega() {
+            builder.set_slab(1, oi, &vec![10.0; n_v * n_v]);
+        }
+        builder.finish_r_slice(1);
+
+        let table = builder.build();
+        let dir_a = Vector3::new(1.0, 0.0, 0.0);
+        let dir_b = Vector3::new(0.0, 1.0, 0.0);
+        let e = table.lookup(5.0, 0.0, &dir_a, &dir_b);
+        assert!(e.is_finite());
+        assert!((e - 10.0).abs() < 1.0, "Expected ~10, got {e}");
+    }
+
+    #[test]
+    fn repulsive_saves_storage() {
+        let n_omega_bins = 4;
+        let omega_step = std::f64::consts::TAU / n_omega_bins as f64;
+        let reference = Vector3::new(1.0, 0.0, 0.0);
+
+        // Use non-constant repulsive data so the non-repulsive builder keeps it as Mesh
+        let make_repulsive_data = |verts: &[[f64; 3]], n_v: usize| -> Vec<f64> {
+            let mut data = vec![0.0; n_v * n_v];
+            for vi in 0..n_v {
+                let va = Vector3::from(verts[vi]);
+                for vj in 0..n_v {
+                    let vb = Vector3::from(verts[vj]);
+                    // All values > 150, but varying
+                    data[vi * n_v + vj] =
+                        200.0 + 50.0 * va.dot(&reference) + 50.0 * vb.dot(&reference);
+                }
+            }
+            data
+        };
+
+        // beta=1.0: energies 150-300 give expm1(-βU) ≈ -1 → repulsive
+        let mut builder_rep = AdaptiveBuilder::new(5.0, 7.0, 1.0, omega_step, 1, 0.01, 1.0);
+
+        // beta≈0: Boltzmann check never triggers → all kept as Mesh
+        let mut builder_full = AdaptiveBuilder::new(5.0, 7.0, 1.0, omega_step, 1, 0.01, 1e-20);
+
+        for b in [&mut builder_rep, &mut builder_full] {
+            let n_v = b.current_n_vertices();
+            let verts = b.vertex_directions(b.current_level()).to_vec();
+            for oi in 0..b.n_omega() {
+                b.set_slab(0, oi, &make_repulsive_data(&verts, n_v));
+            }
+            b.finish_r_slice(0);
+            let n_v = b.current_n_vertices();
+            let verts = b.vertex_directions(b.current_level()).to_vec();
+            for oi in 0..b.n_omega() {
+                b.set_slab(1, oi, &make_repulsive_data(&verts, n_v));
+            }
+            b.finish_r_slice(1);
+        }
+
+        let table_rep = builder_rep.build();
+        let table_full = builder_full.build();
+        assert!(
+            table_rep.data.len() < table_full.data.len(),
+            "Repulsive table ({}) should use less storage than full table ({})",
+            table_rep.data.len(),
+            table_full.data.len()
+        );
     }
 }
