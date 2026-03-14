@@ -1,4 +1,5 @@
 #![warn(missing_docs)]
+#![allow(clippy::trait_duplication_in_bounds)] // triggered by GetSize derive macro
 //! Icosphere-based 6D angular lookup tables for rigid molecule-molecule interactions.
 //!
 //! Stores pre-computed pairwise energies over six degrees of freedom

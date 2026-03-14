@@ -7,18 +7,28 @@ use nalgebra::{Quaternion, UnitVector3};
 const Z: Vector3 = Vector3::new(0.0, 0.0, 1.0);
 const NEG_Z: Vector3 = Vector3::new(0.0, 0.0, -1.0);
 
-/// `rotation_between` that handles anti-parallel vectors (where nalgebra returns `None`).
+/// Rotation that maps `from` to `to` (both assumed unit-length).
+///
+/// Uses the half-angle quaternion formula `q = (1 + dot, cross)` normalised,
+/// which avoids the `acos` / `sin` / `cos` calls inside nalgebra's
+/// `rotation_between`.  The anti-parallel case (dot ≈ −1) is handled by
+/// choosing an arbitrary perpendicular axis.
 fn robust_rotation_between(from: &Vector3, to: &Vector3) -> UnitQuaternion {
-    UnitQuaternion::rotation_between(from, to).unwrap_or_else(|| {
-        // Anti-parallel: 180° rotation around any axis perpendicular to `from`
+    let d = from.dot(to);
+    if d < -1.0 + 1e-12 {
+        // Anti-parallel: 180° rotation around any perpendicular axis
         let perp = if from.x.abs() < 0.9 {
             Vector3::x()
         } else {
             Vector3::y()
         };
         let axis = UnitVector3::new_normalize(from.cross(&perp));
-        UnitQuaternion::from_axis_angle(&axis, std::f64::consts::PI)
-    })
+        // For a π rotation the half-angle quaternion is (0, axis).
+        return UnitQuaternion::new_unchecked(Quaternion::new(0.0, axis.x, axis.y, axis.z));
+    }
+    // q = (1 + dot, cross), then normalise.  Norm = sqrt(2 + 2*dot).
+    let c = from.cross(to);
+    UnitQuaternion::new_normalize(Quaternion::new(1.0 + d, c.x, c.y, c.z))
 }
 
 /// Forward: 6D point → (quaternion_a, quaternion_b, separation vector).
@@ -64,8 +74,10 @@ pub fn inverse_orient(
 
     let q_a_inv = q_a.inverse();
 
-    // dir_a: separation direction in molecule A's body frame
-    let dir_a = q_a_inv.transform_vector(separation).normalize();
+    // dir_a: separation direction in molecule A's body frame.
+    // Quaternion rotation preserves length, so dividing by `r` (already
+    // computed) avoids a redundant sqrt inside `.normalize()`.
+    let dir_a = q_a_inv.transform_vector(separation) / r;
 
     // Reconstruct q3 = rotation_between(z, dir_a)
     let q3 = robust_rotation_between(&Z, &dir_a);

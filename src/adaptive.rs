@@ -106,6 +106,11 @@ impl MeshLevel {
         self.locator()
             .find_face_bary(dir, &self.vertices, &self.neighbors)
     }
+
+    /// Find the nearest vertex index for a direction (no triangle search).
+    fn find_nearest_vertex(&self, dir: &Vector3) -> usize {
+        self.locator().find_nearest_vertex(dir, &self.vertices)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +247,10 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
     }
 
     /// Return the value at the nearest vertex pair (no interpolation).
+    ///
+    /// Uses `find_nearest_vertex` which only does the cube-face grid lookup
+    /// and candidate scan, skipping the triangle search and barycentric
+    /// computation that `find_face_bary` would perform.
     fn nearest_vertex_val(
         &self,
         slab_idx: usize,
@@ -251,12 +260,10 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
     ) -> f64 {
         let lvl = &self.levels[level as usize];
         let n_v = lvl.n_vertices;
-        let (face_a, bary_a) = lvl.find_face_bary(dir_a);
-        let (face_b, bary_b) = lvl.find_face_bary(dir_b);
-        let ia = argmax3(&bary_a);
-        let ib = argmax3(&bary_b);
+        let va = lvl.find_nearest_vertex(dir_a);
+        let vb = lvl.find_nearest_vertex(dir_b);
         let base = self.slab_offsets[slab_idx] as usize;
-        self.data[base + face_a[ia] * n_v + face_b[ib]].into()
+        self.data[base + va * n_v + vb].into()
     }
 
     /// Lookup value by nearest R/ω bin with adaptive angular resolution.
@@ -411,7 +418,7 @@ impl AdaptiveBuilder {
     }
 
     /// Current subdivision level index (into `levels`).
-    pub fn current_level(&self) -> usize {
+    pub const fn current_level(&self) -> usize {
         self.current_level
     }
 
@@ -439,18 +446,18 @@ impl AdaptiveBuilder {
     }
 
     /// Number of radial bins.
-    pub fn n_r(&self) -> usize {
+    pub const fn n_r(&self) -> usize {
         self.n_r
     }
 
     /// Number of omega bins.
-    pub fn n_omega(&self) -> usize {
+    pub const fn n_omega(&self) -> usize {
         self.n_omega
     }
 
     /// The R value for a given radial index.
     pub fn r_value(&self, ri: usize) -> f64 {
-        self.rmin + ri as f64 * self.dr
+        (ri as f64).mul_add(self.dr, self.rmin)
     }
 
     /// The ω value for a given omega index.
@@ -570,7 +577,7 @@ impl AdaptiveBuilder {
 
         Table6DAdaptive {
             rmin: self.rmin,
-            rmax: self.rmin + self.n_r as f64 * self.dr,
+            rmax: (self.n_r as f64).mul_add(self.dr, self.rmin),
             dr: self.dr,
             n_r: self.n_r,
             omega_step: self.omega_step,
@@ -581,17 +588,6 @@ impl AdaptiveBuilder {
             data,
             metadata: None,
         }
-    }
-}
-
-/// Index of the largest element in a 3-element array.
-fn argmax3(v: &[f64; 3]) -> usize {
-    if v[0] >= v[1] && v[0] >= v[2] {
-        0
-    } else if v[1] >= v[2] {
-        1
-    } else {
-        2
     }
 }
 

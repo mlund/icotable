@@ -77,6 +77,7 @@ pub(crate) fn search_triangles(
 ) -> (Face, [f64; 3]) {
     let nbrs = &neighbors[nearest];
     let mut best_face = [0usize; 3];
+    let mut best_bary = [0.0f64; 3];
     let mut best_min_bary = f64::NEG_INFINITY;
 
     for (idx_i, &ni) in nbrs.iter().enumerate() {
@@ -97,18 +98,29 @@ pub(crate) fn search_triangles(
             if min_b > best_min_bary {
                 best_min_bary = min_b;
                 best_face = face;
+                best_bary = bary;
             }
         }
     }
 
-    best_face.sort_unstable();
-    let best_bary = projected_barycentric(
-        dir,
-        &vertex_vec3(vertices, best_face[0]),
-        &vertex_vec3(vertices, best_face[1]),
-        &vertex_vec3(vertices, best_face[2]),
-    );
-    (best_face, best_bary)
+    // Sort face indices so callers get a canonical vertex order (needed for
+    // consistent table indexing). Apply the same permutation to the bary
+    // weights so they stay matched to their vertices — this avoids
+    // recomputing projected_barycentric on the sorted face.
+    let mut order = [0usize, 1, 2];
+    order.sort_unstable_by(|&a, &b| best_face[a].cmp(&best_face[b]));
+    (
+        [
+            best_face[order[0]],
+            best_face[order[1]],
+            best_face[order[2]],
+        ],
+        [
+            best_bary[order[0]],
+            best_bary[order[1]],
+            best_bary[order[2]],
+        ],
+    )
 }
 
 /// O(1) nearest-vertex lookup via cube-face projected grids.
@@ -147,8 +159,8 @@ impl VertexLocator {
                     continue;
                 }
                 let (u, w) = (u / d, w / d);
-                let ci = ((u * 0.5 + 0.5) * g as f64) as isize;
-                let cj = ((w * 0.5 + 0.5) * g as f64) as isize;
+                let ci = ((u.mul_add(0.5, 0.5)) * g as f64) as isize;
+                let cj = ((w.mul_add(0.5, 0.5)) * g as f64) as isize;
                 for di in -1..=1isize {
                     for dj in -1..=1isize {
                         let ci2 = ci + di;
@@ -168,6 +180,31 @@ impl VertexLocator {
         Self { grid_size, cells }
     }
 
+    /// Find the nearest vertex to a direction using the cube-face grid.
+    ///
+    /// O(1) grid lookup + small candidate scan. Skips the triangle search and
+    /// barycentric computation, making it cheaper than `find_face_bary` when
+    /// only the nearest vertex index is needed (e.g. no-interpolation tier).
+    pub(crate) fn find_nearest_vertex(&self, dir: &Vector3, vertices: &[[f64; 3]]) -> usize {
+        let dir = dir.normalize();
+        let (face_id, u, w) = cube_project(&[dir.x, dir.y, dir.z]);
+        let g = self.grid_size;
+        let ci = ((u.mul_add(0.5, 0.5)) * g as f64).clamp(0.0, g as f64 - 1.0) as usize;
+        let cj = ((w.mul_add(0.5, 0.5)) * g as f64).clamp(0.0, g as f64 - 1.0) as usize;
+        let candidates = &self.cells[face_id * g * g + ci * g + cj];
+
+        candidates
+            .iter()
+            .map(|&vi| {
+                let vi = vi as usize;
+                let d = (dir - Vector3::from(vertices[vi])).norm_squared();
+                (vi, d)
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("grid cell must not be empty")
+            .0
+    }
+
     pub(crate) fn find_face_bary(
         &self,
         dir: &Vector3,
@@ -177,8 +214,8 @@ impl VertexLocator {
         let dir = dir.normalize();
         let (face_id, u, w) = cube_project(&[dir.x, dir.y, dir.z]);
         let g = self.grid_size;
-        let ci = ((u * 0.5 + 0.5) * g as f64).clamp(0.0, g as f64 - 1.0) as usize;
-        let cj = ((w * 0.5 + 0.5) * g as f64).clamp(0.0, g as f64 - 1.0) as usize;
+        let ci = ((u.mul_add(0.5, 0.5)) * g as f64).clamp(0.0, g as f64 - 1.0) as usize;
+        let cj = ((w.mul_add(0.5, 0.5)) * g as f64).clamp(0.0, g as f64 - 1.0) as usize;
         let candidates = &self.cells[face_id * g * g + ci * g + cj];
 
         let nearest = candidates
@@ -465,6 +502,7 @@ impl TryFrom<&Table6D> for Table6DFlat<half::f16> {
 
 impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
     /// Resolve R/ω bins and icosphere faces for a given query point.
+    #[allow(clippy::type_complexity)]
     fn resolve_bins(
         &self,
         r: f64,
