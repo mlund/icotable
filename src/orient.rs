@@ -150,6 +150,26 @@ mod tests {
         }
     }
 
+    /// Swapping mol A↔B (negate sep, swap quaternions) does NOT produce the
+    /// same 6D coordinates — the decomposition is asymmetric by design.
+    /// For self-interaction tables, callers must average both perspectives.
+    #[test]
+    fn swap_is_asymmetric() {
+        let q_a = UnitQuaternion::new_normalize(Quaternion::new(0.3, 0.5, -0.7, 0.1));
+        let q_b = UnitQuaternion::new_normalize(Quaternion::new(-0.2, 0.8, 0.4, -0.3));
+        let sep = Vector3::new(1.0, 2.0, 3.0) * 50.0;
+
+        let (_, omega1, dir_a1, _) = inverse_orient(&sep, &q_a, &q_b);
+        let (_, omega2, dir_a2, _) = inverse_orient(&(-sep), &q_b, &q_a);
+
+        let omega_diff = ((omega1 - omega2).rem_euclid(std::f64::consts::TAU))
+            .min(std::f64::consts::TAU - (omega1 - omega2).rem_euclid(std::f64::consts::TAU));
+        assert!(
+            omega_diff > 0.01 || (1.0 - dir_a1.dot(&dir_a2).abs()) > 0.01,
+            "Expected asymmetry but got symmetric result"
+        );
+    }
+
     #[test]
     fn anti_parallel_cases() {
         // vertex_i ≈ -z (triggers anti-parallel in q3)
