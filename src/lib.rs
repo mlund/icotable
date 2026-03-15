@@ -34,7 +34,7 @@ mod vertex;
 pub use adaptive::{
     Adaptive3DBuilder, AdaptiveBuilder, SlabResolution, Table3DAdaptive, Table6DAdaptive,
 };
-pub use flat::{Table3DFlat, Table6DFlat, TableMetadata, TailCorrectionTerm};
+pub use flat::{PointGroup, Table3DFlat, Table6DFlat, TableMetadata, TailCorrectionTerm};
 /// Half-precision float for compact table storage.
 pub use half::f16;
 pub use ico::{Face, IcoTable2D, IcoTable4D, Table6D};

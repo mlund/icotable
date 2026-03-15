@@ -395,6 +395,17 @@ pub struct TailCorrectionTerm {
     pub power: u32,
 }
 
+/// Point group symmetry of the molecule pair used to generate a table.
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PointGroup {
+    /// No exploitable symmetry (hetero-dimer or unknown).
+    #[default]
+    Asymmetric,
+    /// Homo-dimer exchange symmetry: E(A,B) = E(B,A).
+    /// Table has been pre-symmetrized so a single lookup suffices.
+    Exchange,
+}
+
 /// Optional metadata attached to a 6D table for tail corrections beyond the table cutoff.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct TableMetadata {
@@ -408,6 +419,11 @@ pub struct TableMetadata {
     pub temperature: Option<f64>,
     /// Coulomb prefactor e²/(4πε₀εᵣ) in kJ·Å/mol/e², multiplied into all tail terms.
     pub electric_prefactor: Option<f64>,
+    /// Point group symmetry of the molecule pair.
+    /// Defaults to `Asymmetric` so tables generated before this field was added
+    /// deserialize correctly without breaking the bincode format.
+    #[serde(default)]
+    pub point_group: PointGroup,
 }
 
 impl TableMetadata {
@@ -1624,6 +1640,7 @@ mod tests {
                 dipole_moments: Some([2.5, 0.0]),
                 temperature: Some(298.15),
                 electric_prefactor: Some(17.83),
+                point_group: PointGroup::Exchange,
             }),
             locator: OnceLock::new(),
         };
@@ -1635,6 +1652,7 @@ mod tests {
         assert_eq!(meta.tail_terms.len(), 2);
         assert_eq!(meta.charges, Some([1.0, -1.0]));
         assert_eq!(meta.temperature, Some(298.15));
+        assert_eq!(meta.point_group, PointGroup::Exchange);
     }
 
     #[test]

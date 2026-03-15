@@ -489,6 +489,102 @@ impl AdaptiveBuilder {
         };
     }
 
+    /// Pre-symmetrize all omega slabs for one R-slice under homo-dimer
+    /// exchange symmetry: `E(A,B) = E(B,A)`.
+    ///
+    /// For each grid point `(ω, vi, vj)`, computes the swap partner's 6D
+    /// coordinates via `orient`→`inverse_orient` and interpolates the
+    /// partner energy from the slab data. Each entry is replaced by the
+    /// average of the forward and swapped energies.
+    ///
+    /// Call after all `set_slab` calls for this `ri` and before `finish_r_slice`.
+    pub fn symmetrize_r_slice(&mut self, ri: usize, r: f64) {
+        let n_omega = self.n_omega;
+        let level = self.current_level;
+        let mesh = &self.levels[level];
+        let n_v = mesh.n_vertices;
+        if n_omega < 2 {
+            return;
+        }
+        let omega_step = self.omega_step;
+
+        // Snapshot slab data for this R (swap partner reads from originals)
+        let slab_range = ri * n_omega..(ri + 1) * n_omega;
+        let original: Vec<Option<Vec<f64>>> = self.slab_data[slab_range.clone()].to_vec();
+
+        let identity = crate::UnitQuaternion::identity();
+
+        for oi in 0..n_omega {
+            let omega = oi as f64 * omega_step;
+            let Some(ref orig_data) = original[oi] else {
+                continue;
+            };
+            let slab_idx = ri * n_omega + oi;
+            let slab = self.slab_data[slab_idx].as_mut().unwrap();
+
+            for vi in 0..n_v {
+                let vert_i = crate::Vector3::from(mesh.vertices[vi]);
+                for vj in 0..n_v {
+                    let vert_j = crate::Vector3::from(mesh.vertices[vj]);
+
+                    // Reconstruct the physical pose, then compute the swapped
+                    // (B-as-reference) perspective's 6D coordinates
+                    let (_q_a, q_b, sep) = crate::orient(r, omega, &vert_i, &vert_j);
+                    let (_r2, omega2, dir_a2, dir_b2) =
+                        crate::inverse_orient(&(-sep), &q_b, &identity);
+
+                    let e_partner = Self::interpolate_from_slabs(
+                        &original, omega2, &dir_a2, &dir_b2, omega_step, mesh,
+                    );
+
+                    let idx = vi * n_v + vj;
+                    slab[idx] = 0.5 * (orig_data[idx] + e_partner);
+                }
+            }
+        }
+    }
+
+    /// Interpolate energy from raw slab data at continuous (ω, dir_a, dir_b).
+    ///
+    /// The swap partner's coordinates don't land on grid points, so we use
+    /// linear interpolation in ω and barycentric interpolation on icosphere
+    /// faces — unlike the runtime lookup which snaps to nearest ω bin.
+    fn interpolate_from_slabs(
+        slab_data: &[Option<Vec<f64>>],
+        omega: f64,
+        dir_a: &crate::Vector3,
+        dir_b: &crate::Vector3,
+        omega_step: f64,
+        mesh: &MeshLevel,
+    ) -> f64 {
+        let n_omega = slab_data.len();
+        let n_v = mesh.n_vertices;
+
+        // ω is periodic in [0, 2π); wrap before binning
+        let omega = omega.rem_euclid(std::f64::consts::TAU);
+        let omega_frac = omega / omega_step;
+        let oi0 = omega_frac as usize % n_omega;
+        let oi1 = (oi0 + 1) % n_omega;
+        let t_omega = omega_frac - omega_frac.floor();
+
+        let (face_a, bary_a) = mesh.find_face_bary(dir_a);
+        let (face_b, bary_b) = mesh.find_face_bary(dir_b);
+
+        let angular_interp = |data: &[f64]| -> f64 {
+            let mut sum = 0.0;
+            for (i, &wa) in bary_a.iter().enumerate() {
+                for (j, &wb) in bary_b.iter().enumerate() {
+                    sum += wa * wb * data[face_a[i] * n_v + face_b[j]];
+                }
+            }
+            sum
+        };
+
+        let e0 = slab_data[oi0].as_ref().map_or(0.0, |d| angular_interp(d));
+        let e1 = slab_data[oi1].as_ref().map_or(0.0, |d| angular_interp(d));
+        (1.0 - t_omega) * e0 + t_omega * e1
+    }
+
     /// Finish an R slice: classify each slab and possibly lower resolution for the next R.
     ///
     /// Per-slab classification (checked in order):
