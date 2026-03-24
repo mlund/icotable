@@ -32,7 +32,8 @@ mod vertex;
 
 // Public API
 pub use adaptive::{
-    Adaptive3DBuilder, AdaptiveBuilder, SlabResolution, Table3DAdaptive, Table6DAdaptive,
+    Adaptive3DBuilder, AdaptiveBuilder, MeshLevel, SlabResolution, Table3DAdaptive,
+    Table6DAdaptive,
 };
 pub use flat::{PointGroup, Table3DFlat, Table6DFlat, TableMetadata, TailCorrectionTerm};
 /// Half-precision float for compact table storage.

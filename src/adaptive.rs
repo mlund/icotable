@@ -211,6 +211,65 @@ impl<T: num_traits::Float + Serialize + serde::de::DeserializeOwned> Table6DAdap
 }
 
 impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
+    /// Get the mesh level used at radial index `ri` (from first Mesh slab found).
+    ///
+    /// Returns `None` if all slabs at this R are Scalar or Repulsive.
+    pub fn mesh_level_at_r(&self, ri: usize) -> Option<&MeshLevel> {
+        let base = ri * self.n_omega;
+        (0..self.n_omega).find_map(|oi| match &self.slab_res[base + oi] {
+            SlabResolution::Mesh { level, .. } => Some(&self.levels[*level as usize]),
+            _ => None,
+        })
+    }
+
+    /// Extract all energies at radial index `ri` as a flat array.
+    ///
+    /// Layout: `energies[vi * n_v * n_omega + vj * n_omega + oi]`
+    /// where `n_v` is the vertex count of the mesh level at this R.
+    ///
+    /// - Mesh slabs: per-vertex-pair energies from the data array.
+    /// - Scalar slabs: the scalar value replicated for all vertex pairs.
+    /// - Repulsive slabs: `f64::INFINITY` for all vertex pairs.
+    ///
+    /// Returns `None` if all slabs are Repulsive, or if `ri` is out of range.
+    pub fn energies_at_r(&self, ri: usize) -> Option<(Vec<f64>, &MeshLevel)> {
+        if ri >= self.n_r {
+            return None;
+        }
+        let level = self.mesh_level_at_r(ri)?;
+        let n_v = level.n_vertices;
+        let n_omega = self.n_omega;
+        let mut energies = vec![f64::INFINITY; n_v * n_v * n_omega];
+
+        for oi in 0..n_omega {
+            let slab_idx = ri * n_omega + oi;
+            match &self.slab_res[slab_idx] {
+                SlabResolution::Repulsive => {} // already INFINITY
+                SlabResolution::Scalar(v) => {
+                    let val = *v as f64;
+                    for vi in 0..n_v {
+                        for vj in 0..n_v {
+                            energies[vi * n_v * n_omega + vj * n_omega + oi] = val;
+                        }
+                    }
+                }
+                SlabResolution::Mesh {
+                    level: lvl_idx, ..
+                } => {
+                    let slab_n_v = self.levels[*lvl_idx as usize].n_vertices;
+                    let base = self.slab_offsets[slab_idx] as usize;
+                    for vi in 0..slab_n_v.min(n_v) {
+                        for vj in 0..slab_n_v.min(n_v) {
+                            energies[vi * n_v * n_omega + vj * n_omega + oi] =
+                                self.data[base + vi * slab_n_v + vj].into();
+                        }
+                    }
+                }
+            }
+        }
+        Some((energies, level))
+    }
+
     /// Resolve R/ω to a slab index, or `None` if out of range.
     fn resolve_slab_idx(&self, r: f64, omega: f64) -> Option<usize> {
         if r < self.rmin || r > self.rmax {
@@ -1365,8 +1424,13 @@ mod tests {
                     0.1 * va.dot(&reference) + 0.1 * vb.dot(&reference);
             }
         }
-        let grad =
-            compute_gradient(&test_data, &lvl.vertices, &lvl.neighbors, n_v_at_level1, beta);
+        let grad = compute_gradient(
+            &test_data,
+            &lvl.vertices,
+            &lvl.neighbors,
+            n_v_at_level1,
+            beta,
+        );
 
         // Set gradient_threshold just above the measured gradient so:
         //   scalar_threshold = gradient_threshold/10 < grad < gradient_threshold
@@ -1396,8 +1460,7 @@ mod tests {
                 let va = Vector3::from(verts[vi]);
                 for vj in 0..n_v {
                     let vb = Vector3::from(verts[vj]);
-                    data[vi * n_v + vj] =
-                        0.1 * va.dot(&reference) + 0.1 * vb.dot(&reference);
+                    data[vi * n_v + vj] = 0.1 * va.dot(&reference) + 0.1 * vb.dot(&reference);
                 }
             }
             builder.set_slab(0, oi, &data);
@@ -1458,23 +1521,22 @@ mod tests {
                 let va = Vector3::from(verts[vi]);
                 for vj in 0..n_v {
                     let vb = Vector3::from(verts[vj]);
-                    data[vi * n_v + vj] =
-                        2.0 * va.dot(&reference) + 2.0 * vb.dot(&reference);
+                    data[vi * n_v + vj] = 2.0 * va.dot(&reference) + 2.0 * vb.dot(&reference);
                 }
             }
             data
         };
 
         // Repulsive builder: high energies → classified as Repulsive → zero storage
-        let mut builder_rep =
-            AdaptiveBuilder::new(5.0, 7.0, 1.0, omega_step, 1, 100.0, beta);
+        let mut builder_rep = AdaptiveBuilder::new(5.0, 7.0, 1.0, omega_step, 1, 100.0, beta);
         // Full builder: moderate energies with angular variation → kept as Mesh
-        let mut builder_full =
-            AdaptiveBuilder::new(5.0, 7.0, 1.0, omega_step, 1, 100.0, beta);
+        let mut builder_full = AdaptiveBuilder::new(5.0, 7.0, 1.0, omega_step, 1, 100.0, beta);
 
         for ri in 0..2 {
             let n_v = builder_rep.current_n_vertices();
-            let verts = builder_rep.vertex_directions(builder_rep.current_level()).to_vec();
+            let verts = builder_rep
+                .vertex_directions(builder_rep.current_level())
+                .to_vec();
             for oi in 0..builder_rep.n_omega() {
                 builder_rep.set_slab(ri, oi, &make_repulsive_data(&verts, n_v));
             }
