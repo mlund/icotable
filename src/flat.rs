@@ -1105,7 +1105,8 @@ mod tests {
         let ri = 1; // r = rmin + 1*dr = 6.0
         for vi in 0..n_v {
             for vj in 0..n_v {
-                data[ri * stride + 0 * n_v * n_v + vi * n_v + vj] = (vi + vj) as f32;
+                let oi = 0;
+                data[ri * stride + oi * n_v * n_v + vi * n_v + vj] = (vi + vj) as f32;
             }
         }
 
@@ -1158,8 +1159,8 @@ mod tests {
             for oi in 0..n_omega {
                 for vi in 0..n_v {
                     let va = Vector3::from(vertices[vi]);
-                    for vj in 0..n_v {
-                        let vb = Vector3::from(vertices[vj]);
+                    for (vj, &vb_raw) in vertices.iter().enumerate().take(n_v) {
+                        let vb = Vector3::from(vb_raw);
                         let idx = ri * stride + oi * n_v * n_v + vi * n_v + vj;
                         data[idx] = f(&va, &vb) as f32;
                     }

@@ -2,7 +2,7 @@ use std::f64::consts::PI;
 
 use crate::{IcoSphere, Vector3};
 use anyhow::{Context, Result};
-use glam::f32::Vec3A;
+use glam::f32::Vec3A; // SIMD-aligned f32 vector; preferred over nalgebra here for performance in tight loops
 use hexasphere::AdjacencyBuilder;
 
 const UNIT_SPHERE_AREA: f64 = 4.0 * PI;
