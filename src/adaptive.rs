@@ -1273,6 +1273,283 @@ mod tests {
         );
     }
 
+    /// Analytic test function: f(dir_a, dir_b) = dot(dir_a, ref)^2 + dot(dir_b, ref)^2.
+    /// Smooth on S² and bounded to [0, 2], suiting both interpolation-accuracy
+    /// checks and non-repulsive classification at β = 1.
+    fn analytic_fn(dir_a: &Vector3, dir_b: &Vector3) -> f64 {
+        let reference = Vector3::new(1.0, 1.0, 1.0).normalize();
+        let da = dir_a.normalize().dot(&reference);
+        let db = dir_b.normalize().dot(&reference);
+        da * da + db * db
+    }
+
+    /// Build an adaptive table whose every vertex pair is filled by `f(dir_a, dir_b)`.
+    ///
+    /// A tiny `gradient_threshold` (1e-9) forces every varying slab to
+    /// `Mesh { interpolate: true }` and suppresses resolution coarsening, so the
+    /// mesh level stays at `max_n_div` for all R. The same spatial function is
+    /// used for every (R, ω) slab, making lookups robust to R/ω bin snapping.
+    fn make_adaptive_table_with_fn(
+        max_n_div: usize,
+        f: impl Fn(&Vector3, &Vector3) -> f64,
+    ) -> Table6DAdaptive<f32> {
+        let mut builder = AdaptiveBuilder::new(
+            5.0,
+            8.0,
+            1.0,
+            std::f64::consts::TAU / 4.0,
+            max_n_div,
+            1e-9,
+            1.0,
+        );
+        for ri in 0..builder.n_r() {
+            let n_v = builder.current_n_vertices();
+            let verts = builder.vertex_directions(builder.current_level()).to_vec();
+            for oi in 0..builder.n_omega() {
+                let mut data = vec![0.0; n_v * n_v];
+                for vi in 0..n_v {
+                    let va = Vector3::from(verts[vi]);
+                    for vj in 0..n_v {
+                        let vb = Vector3::from(verts[vj]);
+                        data[vi * n_v + vj] = f(&va, &vb);
+                    }
+                }
+                builder.set_slab(ri, oi, &data);
+            }
+            builder.finish_r_slice(ri);
+        }
+        builder.build()
+    }
+
+    /// Quaternion-driven lookups that land on exact icosphere vertices should
+    /// return the stored value. Drives the full `orient → inverse_orient →
+    /// lookup` path (as Faunus does) with an arbitrary lab-frame rotation, and
+    /// checks the O(1) nearest-vertex / barycentric lookup recovers the exact
+    /// sampled energy. Mirrors the `Table6DFlat` test of the same name.
+    #[test]
+    fn lookup_via_orient_inverse_roundtrip() {
+        use crate::orient::{inverse_orient, orient};
+        use nalgebra::UnitQuaternion;
+        use rand::Rng;
+
+        let table = make_adaptive_table_with_fn(3, analytic_fn); // 162 vertices
+        let mut rng = rand::thread_rng();
+
+        // Skip ri = 0: its bin center sits exactly on rmin, where fp noise in
+        // the recovered r2 can dip below the table's lower bound. Interior
+        // slabs hold identical data, so this loses no coverage.
+        let mut checked = 0usize;
+        for ri in 1..table.n_r {
+            let Some(level) = table.mesh_level_at_r(ri) else {
+                continue; // Scalar/Repulsive slab — no per-vertex storage
+            };
+            let verts = &level.vertices;
+            let r = table.rmin + ri as f64 * table.dr;
+
+            // Cover the 12 pentagonal (degree-5) vertices — the icosphere's
+            // special points — plus a spread of ordinary vertices. Vertices are
+            // BFS-reordered, so pentagonal ones are identified by neighbor
+            // count, not by index.
+            let mut idxs: Vec<usize> = (0..verts.len())
+                .filter(|&i| level.neighbors[i].len() == 5)
+                .collect();
+            idxs.extend((0..verts.len()).step_by(15));
+            idxs.sort_unstable();
+            idxs.dedup();
+
+            for &vi in &idxs {
+                for &vj in &idxs {
+                    let va = Vector3::from(verts[vi]);
+                    let vb = Vector3::from(verts[vj]);
+                    let exact = analytic_fn(&va, &vb);
+
+                    for _ in 0..3 {
+                        let omega = rng.gen_range(0.0..std::f64::consts::TAU);
+                        let (q_a, q_b, sep) = orient(r, omega, &va, &vb);
+
+                        // Apply an arbitrary rotation to both molecules, as if
+                        // they were placed/rotated during a simulation step.
+                        let random_q = UnitQuaternion::from_euler_angles(
+                            rng.gen_range(0.0..std::f64::consts::TAU),
+                            rng.gen_range(0.0..std::f64::consts::PI),
+                            rng.gen_range(0.0..std::f64::consts::TAU),
+                        );
+                        let q_a_rot = random_q * q_a;
+                        let q_b_rot = random_q * q_b;
+                        let sep_rot = random_q.transform_vector(&sep);
+
+                        let (r2, omega2, dir_a2, dir_b2) =
+                            inverse_orient(&sep_rot, &q_a_rot, &q_b_rot);
+                        let looked_up = table.lookup(r2, omega2, &dir_a2, &dir_b2);
+
+                        assert!(
+                            (looked_up - exact).abs() < 0.05,
+                            "ri={ri}, vi={vi}, vj={vj}: looked_up={looked_up:.4}, \
+                             exact={exact:.4}, omega={omega2:.4}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 0, "no mesh slabs were exercised");
+    }
+
+    /// Off-vertex queries should interpolate close to the underlying smooth
+    /// function. Confirms at least one slab actually uses barycentric
+    /// interpolation, then bounds the interpolation error over random
+    /// directions. Mirrors the `Table6DFlat` test of the same name.
+    #[test]
+    fn lookup_off_vertex_interpolation() {
+        use rand::Rng;
+
+        let table = make_adaptive_table_with_fn(3, analytic_fn); // 162 vertices
+
+        // The test is only meaningful if interpolation is actually exercised.
+        assert!(
+            table
+                .slab_res
+                .iter()
+                .any(|sr| matches!(sr, SlabResolution::Mesh { interpolate: true, .. })),
+            "expected at least one interpolated mesh slab"
+        );
+
+        let mut rng = rand::thread_rng();
+        let mut max_err = 0.0f64;
+
+        let random_dir = |rng: &mut rand::rngs::ThreadRng| loop {
+            let x: f64 = rng.gen_range(-1.0..1.0);
+            let y: f64 = rng.gen_range(-1.0..1.0);
+            let z: f64 = rng.gen_range(-1.0..1.0);
+            let r2 = x * x + y * y + z * z;
+            if r2 > 0.01 && r2 < 1.0 {
+                return Vector3::new(x, y, z).normalize();
+            }
+        };
+
+        for _ in 0..500 {
+            let dir_a = random_dir(&mut rng);
+            let dir_b = random_dir(&mut rng);
+
+            // r = rmin, omega = 0 selects a mesh slab (ri = 0, oi = 0).
+            let interpolated = table.lookup(table.rmin, 0.0, &dir_a, &dir_b);
+            let exact = analytic_fn(&dir_a, &dir_b);
+            max_err = max_err.max((interpolated - exact).abs());
+        }
+
+        // Axis-aligned (cube-face centre) and body-diagonal (cube-corner)
+        // directions fall in the projected grid's degenerate cells; verify
+        // they interpolate within the same tolerance as generic directions.
+        let inv_sqrt3 = 1.0 / 3.0_f64.sqrt();
+        let degenerate = [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(-1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, -1.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            Vector3::new(0.0, 0.0, -1.0),
+            Vector3::new(inv_sqrt3, inv_sqrt3, inv_sqrt3),
+            Vector3::new(-inv_sqrt3, -inv_sqrt3, inv_sqrt3),
+        ];
+        for &dir_a in &degenerate {
+            for &dir_b in &degenerate {
+                let interpolated = table.lookup(table.rmin, 0.0, &dir_a, &dir_b);
+                let exact = analytic_fn(&dir_a, &dir_b);
+                max_err = max_err.max((interpolated - exact).abs());
+            }
+        }
+
+        assert!(
+            max_err < 0.3,
+            "Max interpolation error {max_err:.4} exceeds tolerance for smooth quadratic"
+        );
+    }
+
+    /// Exercises the O(1) nearest-vertex lookup path (`Mesh { interpolate:
+    /// false }`), which the barycentric tests never reach. At an exact vertex it
+    /// must return the stored value; a small perturbation toward a neighbour —
+    /// where the same vertex is still nearest — must return the *same* value,
+    /// confirming the lookup is piecewise-constant (no interpolation leaks in).
+    #[test]
+    fn lookup_nearest_vertex_no_interpolation() {
+        let n_div = 2;
+        let lvl = MeshLevel::new(n_div);
+        let n_v = lvl.n_vertices;
+        let beta = 1.0;
+
+        // Fill with a smooth function and measure its Boltzmann-weight gradient,
+        // then set the threshold so the slab lands in the nearest-vertex band:
+        //   scalar_threshold = threshold/10 < grad < threshold.
+        let mut data = vec![0.0; n_v * n_v];
+        for vi in 0..n_v {
+            let va = Vector3::from(lvl.vertices[vi]);
+            for vj in 0..n_v {
+                let vb = Vector3::from(lvl.vertices[vj]);
+                data[vi * n_v + vj] = analytic_fn(&va, &vb);
+            }
+        }
+        let grad = compute_gradient(&data, &lvl.vertices, &lvl.neighbors, n_v, beta);
+        let gradient_threshold = grad * 2.0;
+
+        let mut builder = AdaptiveBuilder::new(
+            5.0,
+            8.0,
+            1.0,
+            std::f64::consts::TAU / 4.0,
+            n_div,
+            gradient_threshold,
+            beta,
+        );
+        // Fill an interior R slab (ri = 1, r = 6.0) to dodge the rmin boundary.
+        let ri = 1;
+        for oi in 0..builder.n_omega() {
+            builder.set_slab(ri, oi, &data);
+        }
+        builder.finish_r_slice(ri);
+        let table = builder.build();
+
+        let r = table.rmin + ri as f64 * table.dr;
+        assert!(
+            matches!(
+                table.slab_res[ri * table.n_omega],
+                SlabResolution::Mesh {
+                    interpolate: false,
+                    ..
+                }
+            ),
+            "expected a nearest-vertex (non-interpolated) mesh slab, got {:?}",
+            table.slab_res[ri * table.n_omega]
+        );
+
+        let level = table.mesh_level_at_r(ri).unwrap();
+        for vi in (0..n_v).step_by(7) {
+            for vj in (0..n_v).step_by(11) {
+                let va = Vector3::from(level.vertices[vi]);
+                let vb = Vector3::from(level.vertices[vj]);
+                let exact = analytic_fn(&va, &vb);
+
+                // Exact vertex → stored value, no interpolation contamination.
+                let at_vertex = table.lookup(r, 0.0, &va, &vb);
+                assert!(
+                    (at_vertex - exact).abs() < 1e-3,
+                    "vi={vi}, vj={vj}: nearest-vertex lookup {at_vertex:.5} != stored {exact:.5}"
+                );
+
+                // Nudge dir_a 10% toward a neighbour: va is still the nearest
+                // vertex, so a nearest-vertex lookup must be unchanged.
+                let nb = level.neighbors[vi][0] as usize;
+                let neighbor = Vector3::from(level.vertices[nb]);
+                let perturbed = (va + 0.1 * (neighbor - va)).normalize();
+                let near_vertex = table.lookup(r, 0.0, &perturbed, &vb);
+                assert!(
+                    (near_vertex - exact).abs() < 1e-3,
+                    "vi={vi}, vj={vj}: perturbed lookup {near_vertex:.5} should equal vertex \
+                     value {exact:.5} (piecewise-constant); interpolation leaked in"
+                );
+            }
+        }
+    }
+
     #[test]
     fn adaptive_resolution_decreases() {
         // Use a high gradient threshold so the builder always wants to go coarser
