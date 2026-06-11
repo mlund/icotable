@@ -1550,6 +1550,90 @@ mod tests {
         }
     }
 
+    /// Verifies ω-bin selection through `lookup`, including the periodic wrap at
+    /// ω = 0 / TAU and nearest-bin rounding. Every other lookup test fills
+    /// identical data across ω, so this is the only check that the ω index is
+    /// actually computed correctly.
+    #[test]
+    fn lookup_selects_correct_omega_bin() {
+        let omega_step = std::f64::consts::TAU / 8.0;
+        let mut builder = AdaptiveBuilder::new(5.0, 8.0, 1.0, omega_step, 1, 1.0, 0.1);
+        let n_omega = builder.n_omega();
+
+        // Each ω slab is a distinct constant → classified Scalar, so a lookup
+        // returns exactly that slab's value, isolating ω-bin selection from
+        // angular interpolation.
+        let value = |oi: usize| 10.0 + oi as f64;
+        for ri in 0..builder.n_r() {
+            // n_v is read per R-slice: all-Scalar slices make the builder coarsen.
+            let n_v = builder.current_n_vertices();
+            for oi in 0..n_omega {
+                builder.set_slab(ri, oi, &vec![value(oi); n_v * n_v]);
+            }
+            builder.finish_r_slice(ri);
+        }
+        let table = builder.build();
+
+        let dir = Vector3::new(1.0, 0.0, 0.0);
+        let r = table.rmin + table.dr; // interior R bin
+
+        // Each bin centre maps to its own value.
+        for oi in 0..n_omega {
+            let e = table.lookup(r, oi as f64 * omega_step, &dir, &dir);
+            assert!(
+                (e - value(oi)).abs() < 1e-3,
+                "ω bin {oi}: lookup {e:.3} != {:.3}",
+                value(oi)
+            );
+        }
+
+        // Periodic wrap via rem_euclid: ω = TAU → bin 0; ω = −step → last bin;
+        // a tiny negative ω wraps forward to bin 0.
+        let last = n_omega - 1;
+        let e_tau = table.lookup(r, std::f64::consts::TAU, &dir, &dir);
+        assert!(
+            (e_tau - value(0)).abs() < 1e-3,
+            "ω = TAU should wrap to bin 0, got {e_tau:.3}"
+        );
+        let e_neg = table.lookup(r, -omega_step, &dir, &dir);
+        assert!(
+            (e_neg - value(last)).abs() < 1e-3,
+            "ω = −step should wrap to bin {last}, got {e_neg:.3}"
+        );
+        let e_tiny_neg = table.lookup(r, -1e-9, &dir, &dir);
+        assert!(
+            (e_tiny_neg - value(0)).abs() < 1e-3,
+            "ω = −ε should wrap to bin 0, got {e_tiny_neg:.3}"
+        );
+
+        // The seam between the last bin and bin 0 sits at (last + 0.5)·step:
+        // a positive ω just past it wraps *forward* to bin 0 (it is nearer the
+        // bin-0 centre at TAU), rather than rounding back to the last bin.
+        let e_seam_lo = table.lookup(r, (last as f64 + 0.4) * omega_step, &dir, &dir);
+        assert!(
+            (e_seam_lo - value(last)).abs() < 1e-3,
+            "ω = (last+0.4)·step should stay in bin {last}, got {e_seam_lo:.3}"
+        );
+        let e_seam_hi = table.lookup(r, (last as f64 + 0.6) * omega_step, &dir, &dir);
+        assert!(
+            (e_seam_hi - value(0)).abs() < 1e-3,
+            "ω = (last+0.6)·step should wrap to bin 0, got {e_seam_hi:.3}"
+        );
+
+        // Nearest-bin rounding around a bin boundary (between bins 2 and 3 at
+        // 2.5·step): just below stays in 2, just above rounds up to 3.
+        let e_below = table.lookup(r, 2.4 * omega_step, &dir, &dir);
+        assert!(
+            (e_below - value(2)).abs() < 1e-3,
+            "ω = 2.4·step should bin to 2, got {e_below:.3}"
+        );
+        let e_above = table.lookup(r, 2.6 * omega_step, &dir, &dir);
+        assert!(
+            (e_above - value(3)).abs() < 1e-3,
+            "ω = 2.6·step should bin to 3, got {e_above:.3}"
+        );
+    }
+
     #[test]
     fn adaptive_resolution_decreases() {
         // Use a high gradient threshold so the builder always wants to go coarser
