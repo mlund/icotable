@@ -463,16 +463,16 @@ pub struct Table6DFlat<T: num_traits::Float> {
     pub dr: f64,
     /// Number of radial bins.
     pub n_r: usize,
-    /// Dihedral angle bin width (radians).
-    pub omega_step: f64,
+    /// Dihedral angle bin width (radians). Internal to the lookup machinery.
+    omega_step: f64,
     /// Number of dihedral angle bins.
     pub n_omega: usize,
     /// Number of icosphere vertices.
     pub n_vertices: usize,
-    /// Normalized unit-sphere vertex positions `[x, y, z]`.
-    pub vertices: Vec<[f64; 3]>,
-    /// Neighbor indices per vertex.
-    pub neighbors: Vec<Vec<u16>>,
+    /// Normalized unit-sphere vertex positions `[x, y, z]`. Lookup-internal mesh.
+    vertices: Vec<[f64; 3]>,
+    /// Neighbor indices per vertex. Lookup-internal mesh.
+    neighbors: Vec<Vec<u16>>,
     /// Flat data array.
     pub data: Vec<T>,
     /// Optional metadata for tail corrections beyond the table cutoff.
@@ -631,6 +631,31 @@ impl TryFrom<&Table6D> for Table6DFlat<half::f16> {
     }
 }
 
+/// Boltzmann-weighted combination of stencil energies (log-sum-exp).
+///
+/// Returns `u_min - ln(Σ wᵢ exp(-β (eᵢ - u_min))) / β`. Shifting by the minimum
+/// energy keeps the exponentials in range; `INFINITY` is returned when every
+/// energy is infinite (fully repulsive) or the weighted sum underflows to zero.
+/// Interpolating the Boltzmann factor rather than the energy avoids the
+/// Jensen-inequality bias on convex surfaces. `weights` and `energies` index
+/// the same interpolation stencil. `beta` must be positive.
+fn boltzmann_average(weights: &[f64], energies: &[f64], beta: f64) -> f64 {
+    debug_assert_eq!(weights.len(), energies.len());
+    let u_min = energies.iter().copied().fold(f64::INFINITY, f64::min);
+    if u_min.is_infinite() {
+        return f64::INFINITY;
+    }
+    let sum: f64 = weights
+        .iter()
+        .zip(energies)
+        .map(|(w, e)| w * (-beta * (e - u_min)).exp())
+        .sum();
+    if sum <= 0.0 {
+        return f64::INFINITY;
+    }
+    u_min - sum.ln() / beta
+}
+
 impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
     /// Resolve R/ω bins and icosphere faces for a given query point.
     #[allow(clippy::type_complexity)]
@@ -696,35 +721,33 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
             None => return 0.0,
         };
 
-        // Shift by u_min before exp() to prevent fp overflow (log-sum-exp trick);
-        // the final `+ u_min` restores the correct result.
-        let mut vals = [0.0f64; 9];
-        let mut u_min = f64::INFINITY;
+        let mut weights = [0.0f64; 9];
+        let mut energies = [0.0f64; 9];
         for i in 0..3 {
             for j in 0..3 {
-                let idx = base + face_a[i] * self.n_vertices + face_b[j];
-                let val: f64 = self.data[idx].into();
-                vals[i * 3 + j] = val;
-                if val < u_min {
-                    u_min = val;
-                }
+                weights[i * 3 + j] = bary_a[i] * bary_b[j];
+                energies[i * 3 + j] = self.data[base + face_a[i] * self.n_vertices + face_b[j]].into();
             }
         }
-        if u_min.is_infinite() {
-            return f64::INFINITY;
-        }
+        boltzmann_average(&weights, &energies, beta)
+    }
+}
 
-        let mut sum = 0.0;
-        for i in 0..3 {
-            for j in 0..3 {
-                sum += bary_a[i] * bary_b[j] * (-beta * (vals[i * 3 + j] - u_min)).exp();
-            }
-        }
+impl<T: num_traits::Float> crate::lookup::TabulatedInteraction for Table6DFlat<T> {
+    fn r_range(&self) -> (f64, f64) {
+        (self.rmin, self.rmax)
+    }
+    fn metadata(&self) -> Option<&TableMetadata> {
+        self.metadata.as_ref()
+    }
+}
 
-        if sum <= 0.0 {
-            return f64::INFINITY;
+impl<T: num_traits::Float + Into<f64>> crate::lookup::Lookup6D for Table6DFlat<T> {
+    fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3, beta: Option<f64>) -> f64 {
+        match beta {
+            Some(beta) => self.lookup_boltzmann(r, omega, dir_a, dir_b, beta),
+            None => self.lookup(r, omega, dir_a, dir_b),
         }
-        u_min - sum.ln() / beta
     }
 }
 
@@ -898,10 +921,10 @@ pub struct Table3DFlat<T: num_traits::Float> {
     pub n_r: usize,
     /// Number of icosphere vertices.
     pub n_vertices: usize,
-    /// Normalized unit-sphere vertex positions `[x, y, z]`.
-    pub vertices: Vec<[f64; 3]>,
-    /// Neighbor indices per vertex.
-    pub neighbors: Vec<Vec<u16>>,
+    /// Normalized unit-sphere vertex positions `[x, y, z]`. Lookup-internal mesh.
+    vertices: Vec<[f64; 3]>,
+    /// Neighbor indices per vertex. Lookup-internal mesh.
+    neighbors: Vec<Vec<u16>>,
     /// Flat data array.
     pub data: Vec<T>,
     /// Cached O(1) face/vertex locator, lazy-initialized on first lookup.
@@ -1004,6 +1027,44 @@ impl<T: num_traits::Float + Into<f64>> Table3DFlat<T> {
         }
         result
     }
+
+    /// Boltzmann-weighted interpolation over the three stencil vertices.
+    ///
+    /// Interpolating `exp(-beta*u)` and inverting avoids the Jensen-inequality
+    /// bias of linear interpolation on a convex energy surface (mirrors
+    /// [`Table6DFlat::lookup_boltzmann`]). `beta` must be positive.
+    pub fn lookup_boltzmann(&self, r: f64, direction: &Vector3, beta: f64) -> f64 {
+        debug_assert!(beta > 0.0, "beta must be positive, got {beta}");
+        if r < self.rmin || r > self.rmax {
+            return 0.0;
+        }
+        let ri = ((r - self.rmin) / self.dr + 0.5) as usize;
+        let ri = ri.min(self.n_r.saturating_sub(1));
+
+        let grid = self
+            .locator
+            .get_or_init(|| FaceGrid::new(&self.vertices, &self.neighbors));
+        let (face, bary) = grid.find_face_bary(direction);
+        let base = ri * self.n_vertices;
+
+        let energies = face.map(|vi| self.data[base + vi].into());
+        boltzmann_average(&bary, &energies, beta)
+    }
+}
+
+impl<T: num_traits::Float> crate::lookup::TabulatedInteraction for Table3DFlat<T> {
+    fn r_range(&self) -> (f64, f64) {
+        (self.rmin, self.rmax)
+    }
+}
+
+impl<T: num_traits::Float + Into<f64>> crate::lookup::Lookup3D for Table3DFlat<T> {
+    fn lookup(&self, r: f64, dir: &Vector3, beta: Option<f64>) -> f64 {
+        match beta {
+            Some(beta) => self.lookup_boltzmann(r, dir, beta),
+            None => self.lookup(r, dir),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1040,6 +1101,35 @@ mod tests {
             metadata: None,
             locator: OnceLock::new(),
         }
+    }
+
+    #[test]
+    fn lookup6d_trait_dispatch_matches_inherent() {
+        use crate::lookup::{Lookup6D, TabulatedInteraction};
+        let table = make_test_table(42, 3, 4);
+        let dir = Vector3::new(1.0, 0.0, 0.0);
+        let r = table.rmin + 1.0;
+
+        // Trait `lookup(..., None)` equals the inherent linear lookup; generic
+        // and `dyn` dispatch agree — the abstraction adds no behavior.
+        let inherent = table.lookup(r, 0.0, &dir, &dir);
+        assert_eq!(inherent, Lookup6D::lookup(&table, r, 0.0, &dir, &dir, None));
+
+        fn via_generic<L: Lookup6D>(t: &L, r: f64, d: &Vector3) -> f64 {
+            t.lookup(r, 0.0, d, d, None)
+        }
+        let dyn_ref: &dyn Lookup6D = &table;
+        assert_eq!(
+            via_generic(&table, r, &dir),
+            dyn_ref.lookup(r, 0.0, &dir, &dir, None)
+        );
+
+        // Boltzmann path reachable via `Some(beta)`; accessor matches the fields.
+        assert_eq!(
+            Lookup6D::lookup(&table, r, 0.0, &dir, &dir, Some(1.0)),
+            table.lookup_boltzmann(r, 0.0, &dir, &dir, 1.0)
+        );
+        assert_eq!(table.r_range(), (table.rmin, table.rmax));
     }
 
     #[test]

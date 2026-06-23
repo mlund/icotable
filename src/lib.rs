@@ -23,6 +23,8 @@ pub mod flat;
 /// Core icosphere tables and barycentric interpolation.
 pub mod ico;
 mod icosphere;
+/// Scheme-independent lookup traits over the tabulated interaction tables.
+pub mod lookup;
 /// Forward and inverse coordinate transforms.
 pub mod orient;
 mod spherical;

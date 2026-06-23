@@ -166,8 +166,8 @@ pub struct Table6DAdaptive<T: num_traits::Float> {
     pub dr: f64,
     /// Number of radial bins.
     pub n_r: usize,
-    /// Dihedral angle bin width (radians).
-    pub omega_step: f64,
+    /// Dihedral angle bin width (radians). Internal to the lookup machinery.
+    omega_step: f64,
     /// Number of dihedral angle bins.
     pub n_omega: usize,
     /// Pre-built mesh levels (typically 2-4, indexed by `SlabResolution::Mesh::level`).
@@ -403,6 +403,24 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
                 }
                 u_min - sum.ln() / beta
             }
+        }
+    }
+}
+
+impl<T: num_traits::Float> crate::lookup::TabulatedInteraction for Table6DAdaptive<T> {
+    fn r_range(&self) -> (f64, f64) {
+        (self.rmin, self.rmax)
+    }
+    fn metadata(&self) -> Option<&TableMetadata> {
+        self.metadata.as_ref()
+    }
+}
+
+impl<T: num_traits::Float + Into<f64>> crate::lookup::Lookup6D for Table6DAdaptive<T> {
+    fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3, beta: Option<f64>) -> f64 {
+        match beta {
+            Some(beta) => self.lookup_boltzmann(r, omega, dir_a, dir_b, beta),
+            None => self.lookup(r, omega, dir_a, dir_b),
         }
     }
 }
@@ -804,6 +822,24 @@ impl<T: num_traits::Float + Into<f64>> Table3DAdaptive<T> {
                 }
                 u_min - sum.ln() / beta
             }
+        }
+    }
+}
+
+impl<T: num_traits::Float> crate::lookup::TabulatedInteraction for Table3DAdaptive<T> {
+    fn r_range(&self) -> (f64, f64) {
+        (self.rmin, self.rmax)
+    }
+    fn metadata(&self) -> Option<&TableMetadata> {
+        self.metadata.as_ref()
+    }
+}
+
+impl<T: num_traits::Float + Into<f64>> crate::lookup::Lookup3D for Table3DAdaptive<T> {
+    fn lookup(&self, r: f64, dir: &Vector3, beta: Option<f64>) -> f64 {
+        match beta {
+            Some(beta) => self.lookup_boltzmann(r, dir, beta),
+            None => self.lookup(r, dir),
         }
     }
 }
