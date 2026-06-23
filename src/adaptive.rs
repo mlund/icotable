@@ -194,13 +194,6 @@ impl<T: num_traits::Float + Serialize + serde::de::DeserializeOwned> Table6DAdap
         load_bincode(path.as_ref())
     }
 
-    /// Evaluate tail correction energy beyond the table cutoff.
-    ///
-    /// Returns 0 if no tail terms or no electric prefactor is present.
-    pub fn tail_energy(&self, r: f64) -> f64 {
-        self.metadata.as_ref().map_or(0.0, |m| m.tail_energy(r))
-    }
-
     /// Validate that tail correction metadata is self-consistent.
     pub fn validate_metadata(&self) -> Result<()> {
         if let Some(m) = &self.metadata {
@@ -329,7 +322,7 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
     }
 
     /// Lookup value by nearest R/ω bin with adaptive angular resolution.
-    pub fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3) -> f64 {
+    pub(crate) fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3) -> f64 {
         let Some(slab_idx) = self.resolve_slab_idx(r, omega) else {
             return 0.0;
         };
@@ -358,7 +351,7 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
     }
 
     /// Boltzmann-weighted interpolation: interpolate exp(-beta*u) then invert.
-    pub fn lookup_boltzmann(
+    pub(crate) fn lookup_boltzmann(
         &self,
         r: f64,
         omega: f64,
@@ -720,11 +713,6 @@ impl<T: num_traits::Float + Serialize + serde::de::DeserializeOwned> Table3DAdap
         load_bincode(path.as_ref())
     }
 
-    /// Evaluate tail correction energy beyond the table cutoff.
-    pub fn tail_energy(&self, r: f64) -> f64 {
-        self.metadata.as_ref().map_or(0.0, |m| m.tail_energy(r))
-    }
-
     /// Validate that tail correction metadata is self-consistent.
     pub fn validate_metadata(&self) -> Result<()> {
         if let Some(m) = &self.metadata {
@@ -771,7 +759,7 @@ impl<T: num_traits::Float + Into<f64>> Table3DAdaptive<T> {
     }
 
     /// Lookup value by nearest R bin with adaptive angular resolution.
-    pub fn lookup(&self, r: f64, dir: &Vector3) -> f64 {
+    pub(crate) fn lookup(&self, r: f64, dir: &Vector3) -> f64 {
         let Some(slab_idx) = self.resolve_slab_idx(r) else {
             return 0.0;
         };
@@ -793,7 +781,7 @@ impl<T: num_traits::Float + Into<f64>> Table3DAdaptive<T> {
     }
 
     /// Boltzmann-weighted interpolation: interpolate exp(-beta*u) then invert.
-    pub fn lookup_boltzmann(&self, r: f64, dir: &Vector3, beta: f64) -> f64 {
+    pub(crate) fn lookup_boltzmann(&self, r: f64, dir: &Vector3, beta: f64) -> f64 {
         debug_assert!(beta > 0.0, "beta must be positive, got {beta}");
         let Some(slab_idx) = self.resolve_slab_idx(r) else {
             return 0.0;

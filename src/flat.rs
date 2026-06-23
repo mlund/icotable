@@ -535,13 +535,6 @@ impl<T: num_traits::Float + Serialize + DeserializeOwned> Table6DFlat<T> {
         }
     }
 
-    /// Evaluate tail correction energy beyond the table cutoff.
-    ///
-    /// Returns 0 if no tail terms or no electric prefactor is present.
-    pub fn tail_energy(&self, r: f64) -> f64 {
-        self.metadata.as_ref().map_or(0.0, |m| m.tail_energy(r))
-    }
-
     /// Validate that tail correction metadata is self-consistent.
     pub fn validate_metadata(&self) -> Result<()> {
         if let Some(m) = &self.metadata {
@@ -684,7 +677,7 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
     }
 
     /// Lookup value by nearest R/ω bin and barycentric interpolation on icospheres.
-    pub fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3) -> f64 {
+    pub(crate) fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3) -> f64 {
         let (base, face_a, bary_a, face_b, bary_b) = match self.resolve_bins(r, omega, dir_a, dir_b)
         {
             Some(v) => v,
@@ -706,7 +699,7 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
     /// Linear interpolation of a convex energy surface overestimates (Jensen's
     /// inequality). By interpolating the Boltzmann factor instead, we avoid
     /// this systematic bias at repulsive contacts. `beta` must be positive.
-    pub fn lookup_boltzmann(
+    pub(crate) fn lookup_boltzmann(
         &self,
         r: f64,
         omega: f64,
@@ -1007,7 +1000,7 @@ impl TryFrom<&PaddedTable<IcoTable2D<f64>>> for Table3DFlat<half::f16> {
 
 impl<T: num_traits::Float + Into<f64>> Table3DFlat<T> {
     /// Lookup value by nearest R bin and barycentric interpolation on icosphere.
-    pub fn lookup(&self, r: f64, direction: &Vector3) -> f64 {
+    pub(crate) fn lookup(&self, r: f64, direction: &Vector3) -> f64 {
         if r < self.rmin || r > self.rmax {
             return 0.0;
         }
@@ -1033,7 +1026,7 @@ impl<T: num_traits::Float + Into<f64>> Table3DFlat<T> {
     /// Interpolating `exp(-beta*u)` and inverting avoids the Jensen-inequality
     /// bias of linear interpolation on a convex energy surface (mirrors
     /// [`Table6DFlat::lookup_boltzmann`]). `beta` must be positive.
-    pub fn lookup_boltzmann(&self, r: f64, direction: &Vector3, beta: f64) -> f64 {
+    pub(crate) fn lookup_boltzmann(&self, r: f64, direction: &Vector3, beta: f64) -> f64 {
         debug_assert!(beta > 0.0, "beta must be positive, got {beta}");
         if r < self.rmin || r > self.rmax {
             return 0.0;
@@ -1070,6 +1063,7 @@ impl<T: num_traits::Float + Into<f64>> crate::lookup::Lookup3D for Table3DFlat<T
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lookup::TabulatedInteraction;
 
     fn make_test_mesh(min_points: usize) -> (usize, Vec<[f64; 3]>, Vec<Vec<u16>>) {
         let ico = IcoTable2D::<f64>::from_min_points(min_points).unwrap();
@@ -1105,7 +1099,7 @@ mod tests {
 
     #[test]
     fn lookup6d_trait_dispatch_matches_inherent() {
-        use crate::lookup::{Lookup6D, TabulatedInteraction};
+        use crate::lookup::Lookup6D;
         let table = make_test_table(42, 3, 4);
         let dir = Vector3::new(1.0, 0.0, 0.0);
         let r = table.rmin + 1.0;
