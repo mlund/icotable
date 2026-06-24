@@ -1,6 +1,6 @@
 [package]
 name = "icotable"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Icosphere-based 6D angular lookup tables for rigid molecule-molecule interactions"
 authors = ["Mikael Lund <lyssky@icloud.com>"]
