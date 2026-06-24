@@ -26,5 +26,10 @@ half = { version = "2", features = ["num-traits", "serde"] }
 
 [dev-dependencies]
 approx = "0.5"
+divan = "0.1"
 rand = "0.8"
 tempfile = "3"
+
+[[bench]]
+name = "locate"
+harness = false
