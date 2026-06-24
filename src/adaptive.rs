@@ -15,9 +15,7 @@
 //! The repulsive classification uses `β = 1/kT` from the generation
 //! temperature, making the table temperature-dependent.
 
-use crate::flat::{
-    apply_vertex_permutation, bfs_vertex_permutation, load_bincode, save_bincode, TableMetadata,
-};
+use crate::flat::{load_bincode, save_bincode, TableMetadata};
 use crate::ico::Face;
 use crate::subdivision::{Locator, MeshData, Subdivision};
 use crate::Vector3;
@@ -66,32 +64,18 @@ impl MeshLevel {
         Self::with_subdivision(Subdivision::default(), n_div)
     }
 
-    /// Build a mesh level using a specific subdivision scheme.
+    /// Build a mesh level using a specific subdivision scheme. The scheme's
+    /// `build_mesh` returns vertices in its own final order (geodesic BFS-reorders
+    /// for cache locality; lattice keeps its `(face,i,j)` order).
     pub fn with_subdivision(subdivision: Subdivision, n_div: usize) -> Self {
         let MeshData {
-            mut vertices,
+            vertices,
             weights,
-            mut neighbors,
+            neighbors,
         } = subdivision.build_mesh(n_div);
-        let n_vertices = vertices.len();
-
-        // BFS reorder for cache locality.
-        // entries_per_vertex=1 (not 0) to avoid division by zero in slab_size calculation.
-        let perm = bfs_vertex_permutation(&neighbors);
-        apply_vertex_permutation::<u8>(
-            &perm,
-            &mut vertices,
-            &mut neighbors,
-            &mut [],
-            n_vertices,
-            1,
-        );
-        // Apply same BFS permutation to weights
-        let weights: Vec<f64> = perm.iter().map(|&old_idx| weights[old_idx]).collect();
-
         Self {
             n_div,
-            n_vertices,
+            n_vertices: vertices.len(),
             vertices,
             weights,
             neighbors,
@@ -102,8 +86,10 @@ impl MeshLevel {
 
     /// Get or lazily build the scheme's locator.
     fn grid(&self) -> &Locator {
-        self.locator
-            .get_or_init(|| self.subdivision.build_locator(&self.vertices, &self.neighbors))
+        self.locator.get_or_init(|| {
+            self.subdivision
+                .build_locator(self.n_div, &self.vertices, &self.neighbors)
+        })
     }
 
     /// Find the containing face and barycentric coordinates for a direction.
@@ -1212,6 +1198,27 @@ mod tests {
         assert!(bary.iter().all(|&b| b >= -1e-10));
         // Face indices should be valid
         assert!(face.iter().all(|&i| i < lvl.n_vertices));
+    }
+
+    #[test]
+    fn lattice_meshlevel_locator_rebuilds_on_load() {
+        use rand::{Rng, SeedableRng};
+        let lvl = MeshLevel::with_subdivision(Subdivision::Lattice, 4);
+        // Serialize (locator is #[serde(skip)]) and reload: the restored level must
+        // rebuild its lattice locator from the stored subdivision tag + vertex count.
+        let bytes = bincode::serialize(&lvl).unwrap();
+        let restored: MeshLevel = bincode::deserialize(&bytes).unwrap();
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for _ in 0..2000 {
+            let dir = Vector3::new(
+                rng.gen_range(-1.0..1.0),
+                rng.gen_range(-1.0..1.0),
+                rng.gen_range(-1.0..1.0),
+            )
+            .normalize();
+            assert_eq!(lvl.locate(&dir), restored.locate(&dir));
+        }
     }
 
     /// Fill a slab with constant energy → gradient should be 0.

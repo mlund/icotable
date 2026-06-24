@@ -8,10 +8,12 @@
 //! `hexasphere` usage is confined to [`geodesic`]; no other module may touch it.
 
 pub mod geodesic;
+pub mod lattice;
 
 use crate::flat::FaceGrid;
 use crate::ico::Face;
 use crate::Vector3;
+use lattice::AnalyticLattice;
 use serde::{Deserialize, Serialize};
 
 /// The mesh data a subdivision produces for one sphere: unit-sphere vertex
@@ -31,7 +33,9 @@ pub enum Subdivision {
     /// Conventional geodesic icosphere (hexasphere), located by spatial search.
     #[default]
     Geodesic,
-    // Lattice — Jeremi's regular planar lattice with a closed-form locator — lands next.
+    /// Jeremi's regular planar lattice on each icosahedron face, with a
+    /// closed-form locator (no search).
+    Lattice,
 }
 
 impl Subdivision {
@@ -39,14 +43,40 @@ impl Subdivision {
     pub(crate) fn build_mesh(self, n_div: usize) -> MeshData {
         match self {
             Self::Geodesic => geodesic::build_mesh(n_div),
+            Self::Lattice => lattice::build_mesh(n_div),
         }
     }
 
-    /// Build this scheme's locator over an already-built mesh.
-    pub(crate) fn build_locator(self, vertices: &[[f64; 3]], neighbors: &[Vec<u16>]) -> Locator {
+    /// Build this scheme's locator for level `n_div` over an already-built mesh.
+    /// The geodesic search locator needs the mesh; the lattice locator needs only
+    /// the frequency (`n_div`), so this stays consistent with a deserialized table
+    /// (whose `MeshLevel` carries `n_div`).
+    pub(crate) fn build_locator(
+        self,
+        n_div: usize,
+        vertices: &[[f64; 3]],
+        neighbors: &[Vec<u16>],
+    ) -> Locator {
         match self {
             Self::Geodesic => Locator::Geodesic(FaceGrid::new(vertices, neighbors)),
+            Self::Lattice => Locator::Lattice(AnalyticLattice::new(n_div)),
         }
+    }
+
+    /// Vertex count at frequency `n`. The schemes differ: the geodesic ladder
+    /// grows as `10·(n+1)²+2`, the lattice as `10·n²+2` (finer-grained in `n`),
+    /// so resolution logging/CLI must go through this rather than assume one.
+    pub fn n_vertices(self, n: usize) -> usize {
+        match self {
+            Self::Geodesic => 10 * (n + 1) * (n + 1) + 2,
+            Self::Lattice => 10 * n * n + 2,
+        }
+    }
+
+    /// Approximate angular spacing between adjacent vertices (radians) at
+    /// frequency `n` — the mean nearest-neighbor arc, `√(4π / N)`.
+    pub fn angular_resolution(self, n: usize) -> f64 {
+        (4.0 * std::f64::consts::PI / self.n_vertices(n) as f64).sqrt()
     }
 }
 
@@ -55,6 +85,7 @@ impl Subdivision {
 #[derive(Clone, Debug)]
 pub(crate) enum Locator {
     Geodesic(FaceGrid),
+    Lattice(AnalyticLattice),
 }
 
 impl Locator {
@@ -62,6 +93,7 @@ impl Locator {
     pub(crate) fn locate(&self, dir: &Vector3) -> (Face, [f64; 3]) {
         match self {
             Self::Geodesic(grid) => grid.locate(dir),
+            Self::Lattice(loc) => loc.locate(dir),
         }
     }
 
@@ -69,6 +101,53 @@ impl Locator {
     pub(crate) fn find_nearest_vertex(&self, dir: &Vector3) -> usize {
         match self {
             Self::Geodesic(grid) => grid.find_nearest_vertex(dir),
+            Self::Lattice(loc) => loc.find_nearest_vertex(dir),
         }
     }
+}
+
+/// Per-vertex quadrature weights (normalized so uniform = 1.0) for an arbitrary
+/// vertex graph — the Voronoi solid angle, summed as a fan of spherical
+/// triangles over each vertex's neighbors in angular order. Unlike
+/// `geodesic`'s variant it sorts the fan itself, so it works for schemes whose
+/// neighbor lists are not pre-ordered (the lattice).
+pub(crate) fn solid_angle_weights(vertices: &[[f64; 3]], neighbors: &[Vec<u16>]) -> Vec<f64> {
+    let dir = |i: usize| Vector3::from(vertices[i]).normalize();
+    let mut weights = Vec::with_capacity(vertices.len());
+    for (i, nbrs) in neighbors.iter().enumerate() {
+        let vi = dir(i);
+        // Tangent basis at `vi` to sort the neighbors by azimuth.
+        let seed = dir(nbrs[0] as usize);
+        let e1 = (seed - vi * vi.dot(&seed)).normalize();
+        let e2 = vi.cross(&e1);
+        let mut ring: Vec<(f64, Vector3)> = nbrs
+            .iter()
+            .map(|&n| {
+                let d = dir(n as usize);
+                let t = d - vi * vi.dot(&d);
+                (t.dot(&e2).atan2(t.dot(&e1)), d)
+            })
+            .collect();
+        ring.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Neighbor-polygon area; each face's area is shared by its 3 vertices.
+        let mut area = 0.0;
+        for j in 0..ring.len() {
+            area += spherical_triangle_area(&vi, &ring[j].1, &ring[(j + 1) % ring.len()].1);
+        }
+        weights.push(area / 3.0);
+    }
+    let ideal = 4.0 * std::f64::consts::PI / vertices.len() as f64;
+    weights.iter_mut().for_each(|w| *w /= ideal);
+    weights
+}
+
+/// Area of the spherical triangle `(a, b, c)` via spherical excess.
+#[allow(non_snake_case)]
+fn spherical_triangle_area(a: &Vector3, b: &Vector3, c: &Vector3) -> f64 {
+    let angle = |u: &Vector3, v: &Vector3, w: &Vector3| {
+        let vu = (u - v * v.dot(u)).normalize();
+        let vw = (w - v * v.dot(w)).normalize();
+        vu.dot(&vw).clamp(-1.0, 1.0).acos()
+    };
+    angle(b, a, c) + angle(c, b, a) + angle(a, c, b) - std::f64::consts::PI
 }

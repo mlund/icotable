@@ -100,18 +100,33 @@ pub(crate) fn build_mesh(n_div: usize) -> MeshData {
     builder.add_indices(&ico.get_all_indices());
     let adjacency: Vec<Vec<usize>> = builder.finish().iter().map(|n| n.to_vec()).collect();
 
-    let vertices = points
+    let mut vertices: Vec<[f64; 3]> = points
         .iter()
         .map(|p| {
             let v = Vector3::new(p.x as f64, p.y as f64, p.z as f64).normalize();
             [v.x, v.y, v.z]
         })
         .collect();
-    let neighbors = adjacency
+    let mut neighbors: Vec<Vec<u16>> = adjacency
         .iter()
         .map(|nbrs| nbrs.iter().map(|&i| i as u16).collect())
         .collect();
     let weights = weights_from_adjacency(points, &adjacency);
+
+    // BFS reorder for search-locator (FaceGrid) cache locality. Geodesic-specific:
+    // schemes with a closed-form locator (lattice) keep their natural order instead.
+    let n_vertices = vertices.len();
+    let perm = crate::flat::bfs_vertex_permutation(&neighbors);
+    crate::flat::apply_vertex_permutation::<u8>(
+        &perm,
+        &mut vertices,
+        &mut neighbors,
+        &mut [],
+        n_vertices,
+        1,
+    );
+    let weights = perm.iter().map(|&old| weights[old]).collect();
+
     MeshData {
         vertices,
         weights,
