@@ -116,6 +116,21 @@ impl MeshLevel {
     }
 }
 
+impl crate::mesh::AngularMesh for MeshLevel {
+    fn len(&self) -> usize {
+        self.n_vertices
+    }
+    fn direction(&self, i: usize) -> Vector3 {
+        Vector3::from(self.vertices[i])
+    }
+    fn weight(&self, i: usize) -> f64 {
+        self.weights[i]
+    }
+    fn neighbors(&self, i: usize) -> &[u16] {
+        &self.neighbors[i]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SlabResolution
 // ---------------------------------------------------------------------------

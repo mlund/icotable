@@ -25,6 +25,8 @@ pub mod ico;
 mod icosphere;
 /// Scheme-independent lookup traits over the tabulated interaction tables.
 pub mod lookup;
+/// Scheme-independent view of a subdivided sphere as a weighted point graph.
+pub mod mesh;
 /// Forward and inverse coordinate transforms.
 pub mod orient;
 mod spherical;
@@ -41,6 +43,7 @@ pub use flat::{PointGroup, Table3DFlat, Table6DFlat, TableMetadata, TailCorrecti
 /// Half-precision float for compact table storage.
 pub use half::f16;
 pub use ico::{Face, IcoTable2D, IcoTable4D, Table6D};
+pub use mesh::AngularMesh;
 pub use icosphere::make_icosphere_vertices;
 pub use orient::{inverse_orient, orient};
 pub use spherical::SphericalCoord;
