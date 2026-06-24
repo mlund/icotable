@@ -179,7 +179,7 @@ struct CachedFace {
 /// O(1) face and vertex lookup via cube-face projected grids.
 ///
 /// Two lookup modes:
-/// - `find_face_bary(dir)` — nearest-vertex grid lookup + pre-built per-vertex
+/// - `locate(dir)` — nearest-vertex grid lookup + pre-built per-vertex
 ///   face adjacency with [`CachedFace`] (inlined positions, no pointer chase).
 /// - `find_nearest_vertex(dir)` — O(1) vertex lookup via candidate scan.
 ///
@@ -308,7 +308,7 @@ impl FaceGrid {
     /// projected_barycentric → pick best. Replaces nearest-vertex +
     /// `search_triangles` with pre-built face adjacency (no neighbor-pair
     /// enumeration or adjacency checks at lookup time).
-    pub(crate) fn find_face_bary(&self, dir: &Vector3) -> (Face, [f64; 3]) {
+    pub(crate) fn locate(&self, dir: &Vector3) -> (Face, [f64; 3]) {
         let dir = dir.normalize();
         let nearest = self.nearest_in_cell(&dir, self.cell_index(&dir));
 
@@ -351,7 +351,7 @@ impl FaceGrid {
 ///
 /// O(V) linear scan reference implementation, kept for test verification.
 #[cfg(test)]
-fn find_face_bary(
+fn reference_locate(
     dir: &Vector3,
     vertices: &[[f64; 3]],
     neighbors: &[Vec<u16>],
@@ -671,8 +671,8 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
         let grid = self
             .locator
             .get_or_init(|| FaceGrid::new(&self.vertices, &self.neighbors));
-        let (face_a, bary_a) = grid.find_face_bary(dir_a);
-        let (face_b, bary_b) = grid.find_face_bary(dir_b);
+        let (face_a, bary_a) = grid.locate(dir_a);
+        let (face_b, bary_b) = grid.locate(dir_b);
         Some((base, face_a, bary_a, face_b, bary_b))
     }
 
@@ -850,7 +850,7 @@ pub(crate) fn apply_vertex_permutation<T: Copy>(
 
 /// Projected barycentric coordinates (Ericson, "Real-Time Collision Detection", p141-142).
 ///
-/// Single free function shared by both `Table6DFlat::find_face_bary` and
+/// Single free function shared by both `Table6DFlat::locate` and
 /// `IcoTable2D::barycentric` to avoid duplicating this algorithm.
 pub(crate) fn projected_barycentric(
     p: &Vector3,
@@ -1010,7 +1010,7 @@ impl<T: num_traits::Float + Into<f64>> Table3DFlat<T> {
         let grid = self
             .locator
             .get_or_init(|| FaceGrid::new(&self.vertices, &self.neighbors));
-        let (face, bary) = grid.find_face_bary(direction);
+        let (face, bary) = grid.locate(direction);
         let base = ri * self.n_vertices;
 
         let mut result = 0.0;
@@ -1037,7 +1037,7 @@ impl<T: num_traits::Float + Into<f64>> Table3DFlat<T> {
         let grid = self
             .locator
             .get_or_init(|| FaceGrid::new(&self.vertices, &self.neighbors));
-        let (face, bary) = grid.find_face_bary(direction);
+        let (face, bary) = grid.locate(direction);
         let base = ri * self.n_vertices;
 
         let energies = face.map(|vi| self.data[base + vi].into());
@@ -1629,8 +1629,8 @@ mod tests {
                     break Vector3::new(x, y, z);
                 }
             };
-            let (face_ref, bary_ref) = find_face_bary(&dir, &vertices, &neighbors);
-            let (face_grid, bary_grid) = grid.find_face_bary(&dir);
+            let (face_ref, bary_ref) = reference_locate(&dir, &vertices, &neighbors);
+            let (face_grid, bary_grid) = grid.locate(&dir);
 
             // Both should produce valid barycentric coordinates
             let sum_ref: f64 = bary_ref.iter().sum();

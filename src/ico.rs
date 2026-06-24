@@ -22,9 +22,9 @@
 //! 3. Query with [`IcoTable2D::nearest_face`] + [`IcoTable2D::barycentric`],
 //!    or use [`IcoTable2D::interpolate`] / [`IcoTable4D::interpolate`] directly.
 
-use crate::icosphere::make_weights;
 use crate::{
-    make_icosphere, make_vertices, table::PaddedTable, IcoSphere, SphericalCoord, Vector3, Vertex,
+    make_icosphere, make_vertices, make_weights, table::PaddedTable, IcoSphere, SphericalCoord,
+    Vector3, Vertex,
 };
 use anyhow::{ensure, Result};
 use core::f64::consts::PI;

@@ -16,13 +16,11 @@
 //! temperature, making the table temperature-dependent.
 
 use crate::flat::{
-    apply_vertex_permutation, bfs_vertex_permutation, load_bincode, save_bincode, FaceGrid,
-    TableMetadata,
+    apply_vertex_permutation, bfs_vertex_permutation, load_bincode, save_bincode, TableMetadata,
 };
 use crate::ico::Face;
-use crate::vertex::make_vertices;
+use crate::subdivision::{Locator, MeshData, Subdivision};
 use crate::Vector3;
-use crate::{make_icosphere_by_ndiv, make_weights};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -53,27 +51,29 @@ pub struct MeshLevel {
     pub weights: Vec<f64>,
     /// Neighbor indices per vertex (BFS-reordered).
     pub neighbors: Vec<Vec<u16>>,
-    /// Lazy O(1) face/vertex locator.
+    /// Which subdivision produced this mesh. Drives locator rebuild on load;
+    /// `#[serde(default)]` so pre-tag tables load as `Geodesic`.
+    #[serde(default)]
+    subdivision: Subdivision,
+    /// Lazy direction→cell locator, rebuilt per `subdivision`.
     #[serde(skip, default)]
-    locator: OnceLock<FaceGrid>,
+    locator: OnceLock<Locator>,
 }
 
 impl MeshLevel {
     /// Build a mesh level for the given subdivision count.
     pub fn new(n_div: usize) -> Self {
-        let ico = make_icosphere_by_ndiv(n_div);
-        let verts = make_vertices(&ico);
-        let n_vertices = verts.len();
+        Self::with_subdivision(Subdivision::default(), n_div)
+    }
 
-        let weights = make_weights(&ico);
-        let mut vertices: Vec<[f64; 3]> = verts
-            .iter()
-            .map(|v| {
-                let p = v.pos.normalize();
-                [p.x, p.y, p.z]
-            })
-            .collect();
-        let mut neighbors: Vec<Vec<u16>> = verts.iter().map(|v| v.neighbors.clone()).collect();
+    /// Build a mesh level using a specific subdivision scheme.
+    pub fn with_subdivision(subdivision: Subdivision, n_div: usize) -> Self {
+        let MeshData {
+            mut vertices,
+            weights,
+            mut neighbors,
+        } = subdivision.build_mesh(n_div);
+        let n_vertices = vertices.len();
 
         // BFS reorder for cache locality.
         // entries_per_vertex=1 (not 0) to avoid division by zero in slab_size calculation.
@@ -95,19 +95,20 @@ impl MeshLevel {
             vertices,
             weights,
             neighbors,
+            subdivision,
             locator: OnceLock::new(),
         }
     }
 
-    /// Get or lazily initialize the face grid.
-    fn grid(&self) -> &FaceGrid {
+    /// Get or lazily build the scheme's locator.
+    fn grid(&self) -> &Locator {
         self.locator
-            .get_or_init(|| FaceGrid::new(&self.vertices, &self.neighbors))
+            .get_or_init(|| self.subdivision.build_locator(&self.vertices, &self.neighbors))
     }
 
     /// Find the containing face and barycentric coordinates for a direction.
-    pub fn find_face_bary(&self, dir: &Vector3) -> (Face, [f64; 3]) {
-        self.grid().find_face_bary(dir)
+    pub fn locate(&self, dir: &Vector3) -> (Face, [f64; 3]) {
+        self.grid().locate(dir)
     }
 
     /// Find the nearest vertex index for a direction (no triangle search).
@@ -302,8 +303,8 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
     ) -> (Face, [f64; 3], Face, [f64; 3], [f64; 9]) {
         let lvl = &self.levels[level as usize];
         let n_v = lvl.n_vertices;
-        let (face_a, bary_a) = lvl.find_face_bary(dir_a);
-        let (face_b, bary_b) = lvl.find_face_bary(dir_b);
+        let (face_a, bary_a) = lvl.locate(dir_a);
+        let (face_b, bary_b) = lvl.locate(dir_b);
         let base = self.slab_offsets[slab_idx] as usize;
 
         let mut vals = [0.0f64; 9];
@@ -320,7 +321,7 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
     ///
     /// Uses `find_nearest_vertex` which only does the cube-face grid lookup
     /// and candidate scan, skipping the triangle search and barycentric
-    /// computation that `find_face_bary` would perform.
+    /// computation that `locate` would perform.
     fn nearest_vertex_val(
         &self,
         slab_idx: usize,
@@ -474,7 +475,33 @@ impl AdaptiveBuilder {
     /// * `gradient_threshold` — Boltzmann-weight gradient threshold (1/rad) for
     ///   resolution reduction. Measures max |Δexp(-βU)| / Δangle across neighbors.
     /// * `beta` — Inverse thermal energy 1/kT (mol/kJ)
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        rmin: f64,
+        rmax: f64,
+        dr: f64,
+        omega_step: f64,
+        max_n_div: usize,
+        gradient_threshold: f64,
+        beta: f64,
+    ) -> Self {
+        Self::with_subdivision(
+            Subdivision::default(),
+            rmin,
+            rmax,
+            dr,
+            omega_step,
+            max_n_div,
+            gradient_threshold,
+            beta,
+        )
+    }
+
+    /// Like [`new`](Self::new) but with an explicit subdivision scheme for the
+    /// angular meshes (the future `--locator` CLI choice).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_subdivision(
+        subdivision: Subdivision,
         rmin: f64,
         rmax: f64,
         dr: f64,
@@ -486,8 +513,10 @@ impl AdaptiveBuilder {
         let n_r = ((rmax - rmin) / dr + 0.5) as usize;
         let n_omega = (std::f64::consts::TAU / omega_step + 0.5) as usize;
 
-        // Build all levels from 0..=max_n_div
-        let levels: Vec<MeshLevel> = (0..=max_n_div).map(MeshLevel::new).collect();
+        // Build all levels from 0..=max_n_div with the chosen scheme.
+        let levels: Vec<MeshLevel> = (0..=max_n_div)
+            .map(|n| MeshLevel::with_subdivision(subdivision, n))
+            .collect();
 
         let n_slabs = n_r * n_omega;
         Self {
@@ -763,7 +792,7 @@ impl<T: num_traits::Float + Into<f64>> Table3DAdaptive<T> {
         dir: &Vector3,
     ) -> (Face, [f64; 3], [f64; 3]) {
         let lvl = &self.levels[level as usize];
-        let (face, bary) = lvl.find_face_bary(dir);
+        let (face, bary) = lvl.locate(dir);
         let base = self.slab_offsets[slab_idx] as usize;
         let vals = [
             self.data[base + face[0]].into(),
@@ -886,8 +915,32 @@ impl Adaptive3DBuilder {
         gradient_threshold: f64,
         beta: f64,
     ) -> Self {
+        Self::with_subdivision(
+            Subdivision::default(),
+            rmin,
+            rmax,
+            dr,
+            max_n_div,
+            gradient_threshold,
+            beta,
+        )
+    }
+
+    /// Like [`new`](Self::new) but with an explicit subdivision scheme.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_subdivision(
+        subdivision: Subdivision,
+        rmin: f64,
+        rmax: f64,
+        dr: f64,
+        max_n_div: usize,
+        gradient_threshold: f64,
+        beta: f64,
+    ) -> Self {
         let n_r = ((rmax - rmin) / dr + 0.5) as usize;
-        let levels: Vec<MeshLevel> = (0..=max_n_div).map(MeshLevel::new).collect();
+        let levels: Vec<MeshLevel> = (0..=max_n_div)
+            .map(|n| MeshLevel::with_subdivision(subdivision, n))
+            .collect();
 
         Self {
             rmin,
@@ -1149,10 +1202,10 @@ mod tests {
     }
 
     #[test]
-    fn mesh_level_find_face_bary() {
+    fn mesh_level_locate() {
         let lvl = MeshLevel::new(2);
         let dir = Vector3::new(1.0, 0.0, 0.0);
-        let (face, bary) = lvl.find_face_bary(&dir);
+        let (face, bary) = lvl.locate(&dir);
         // Bary should sum to ~1 and all be non-negative
         let sum: f64 = bary.iter().sum();
         assert_relative_eq!(sum, 1.0, epsilon = 1e-10);

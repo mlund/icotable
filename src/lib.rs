@@ -22,7 +22,6 @@ pub mod adaptive;
 pub mod flat;
 /// Core icosphere tables and barycentric interpolation.
 pub mod ico;
-mod icosphere;
 /// Scheme-independent lookup traits over the tabulated interaction tables.
 pub mod lookup;
 /// Scheme-independent view of a subdivided sphere as a weighted point graph.
@@ -30,6 +29,8 @@ pub mod mesh;
 /// Forward and inverse coordinate transforms.
 pub mod orient;
 mod spherical;
+/// Pluggable icosphere subdivision schemes (geodesic, lattice).
+pub mod subdivision;
 /// Periodic, equidistant padded tables.
 pub mod table;
 mod vertex;
@@ -44,14 +45,15 @@ pub use flat::{PointGroup, Table3DFlat, Table6DFlat, TableMetadata, TailCorrecti
 pub use half::f16;
 pub use ico::{Face, IcoTable2D, IcoTable4D, Table6D};
 pub use mesh::AngularMesh;
-pub use icosphere::make_icosphere_vertices;
 pub use orient::{inverse_orient, orient};
+pub use subdivision::Subdivision;
 pub use spherical::SphericalCoord;
+pub use subdivision::geodesic::make_icosphere_vertices;
 pub use table::PaddedTable;
 
 // Crate-internal re-exports
-pub(crate) use icosphere::{make_icosphere, make_icosphere_by_ndiv, make_weights};
-pub(crate) use vertex::{make_vertices, Vertex};
+pub(crate) use subdivision::geodesic::{make_icosphere, make_vertices, make_weights, IcoSphere};
+pub(crate) use vertex::Vertex;
 
 /// 3×3 matrix of `f64`.
 pub type Matrix3 = nalgebra::Matrix3<f64>;
@@ -59,6 +61,3 @@ pub type Matrix3 = nalgebra::Matrix3<f64>;
 pub type Vector3 = nalgebra::Vector3<f64>;
 /// Unit quaternion for `f64` rotations.
 pub type UnitQuaternion = nalgebra::UnitQuaternion<f64>;
-
-/// Subdivided icosphere mesh.
-pub(crate) type IcoSphere = hexasphere::Subdivided<(), hexasphere::shapes::IcoSphereBase>;
