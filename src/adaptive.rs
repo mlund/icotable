@@ -1221,6 +1221,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lattice_builder_level_zero_is_valid_base() {
+        // The builder constructs levels 0..=max; for the lattice, level 0 must map
+        // to the 12-vertex base (frequency 1), not the degenerate frequency 0.
+        let base = MeshLevel::with_subdivision(Subdivision::Lattice, 0);
+        assert_eq!(base.n_vertices, 12);
+        let (_face, w) = base.locate(&Vector3::new(0.3, 0.5, 0.8).normalize());
+        assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+
+        // A full builder over levels 0..=2 must construct without panicking.
+        let builder = AdaptiveBuilder::with_subdivision(
+            Subdivision::Lattice,
+            1.0,
+            2.0,
+            0.5,
+            0.5,
+            2,
+            0.1,
+            1.0,
+        );
+        assert_eq!(builder.current_n_div(), 2);
+    }
+
     /// Fill a slab with constant energy → gradient should be 0.
     #[test]
     fn gradient_constant_surface() {

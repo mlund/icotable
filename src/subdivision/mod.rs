@@ -39,44 +39,47 @@ pub enum Subdivision {
 }
 
 impl Subdivision {
-    /// Generate the sphere mesh (vertices, weights, neighbors) at level `n_div`.
-    pub(crate) fn build_mesh(self, n_div: usize) -> MeshData {
+    /// Generate the sphere mesh (vertices, weights, neighbors) for builder
+    /// `level` (0-based, coarsest first). Each scheme maps the level to its own
+    /// native parameter so that level 0 is the 12-vertex base for **both**:
+    /// geodesic uses subdivision `n_div = level`; the lattice uses frequency
+    /// `level + 1` (frequency 0 is degenerate).
+    pub(crate) fn build_mesh(self, level: usize) -> MeshData {
         match self {
-            Self::Geodesic => geodesic::build_mesh(n_div),
-            Self::Lattice => lattice::build_mesh(n_div),
+            Self::Geodesic => geodesic::build_mesh(level),
+            Self::Lattice => lattice::build_mesh(level + 1),
         }
     }
 
-    /// Build this scheme's locator for level `n_div` over an already-built mesh.
-    /// The geodesic search locator needs the mesh; the lattice locator needs only
-    /// the frequency (`n_div`), so this stays consistent with a deserialized table
-    /// (whose `MeshLevel` carries `n_div`).
+    /// Build this scheme's locator for builder `level` over an already-built
+    /// mesh. The geodesic search locator needs the mesh; the lattice locator
+    /// needs only its frequency (`level + 1`), so this stays consistent with a
+    /// deserialized table (whose `MeshLevel` carries the level as `n_div`).
     pub(crate) fn build_locator(
         self,
-        n_div: usize,
+        level: usize,
         vertices: &[[f64; 3]],
         neighbors: &[Vec<u16>],
     ) -> Locator {
         match self {
             Self::Geodesic => Locator::Geodesic(FaceGrid::new(vertices, neighbors)),
-            Self::Lattice => Locator::Lattice(AnalyticLattice::new(n_div)),
+            Self::Lattice => Locator::Lattice(AnalyticLattice::new(level + 1)),
         }
     }
 
-    /// Vertex count at frequency `n`. The schemes differ: the geodesic ladder
-    /// grows as `10·(n+1)²+2`, the lattice as `10·n²+2` (finer-grained in `n`),
-    /// so resolution logging/CLI must go through this rather than assume one.
-    pub fn n_vertices(self, n: usize) -> usize {
-        match self {
-            Self::Geodesic => 10 * (n + 1) * (n + 1) + 2,
-            Self::Lattice => 10 * n * n + 2,
-        }
+    /// Vertex count at builder `level`. Both schemes share the resolution ladder
+    /// — level ℓ maps to effective frequency ℓ+1, giving `10·(ℓ+1)²+2` vertices,
+    /// so level 0 is the 12-vertex base either way. The schemes differ in their
+    /// locator and weight uniformity, not in which resolutions they can reach.
+    pub fn n_vertices(self, level: usize) -> usize {
+        let f = level + 1;
+        10 * f * f + 2
     }
 
-    /// Approximate angular spacing between adjacent vertices (radians) at
-    /// frequency `n` — the mean nearest-neighbor arc, `√(4π / N)`.
-    pub fn angular_resolution(self, n: usize) -> f64 {
-        (4.0 * std::f64::consts::PI / self.n_vertices(n) as f64).sqrt()
+    /// Approximate angular spacing between adjacent vertices (radians) at builder
+    /// `level` — the mean nearest-neighbor arc, `√(4π / N)`.
+    pub fn angular_resolution(self, level: usize) -> f64 {
+        (4.0 * std::f64::consts::PI / self.n_vertices(level) as f64).sqrt()
     }
 }
 
