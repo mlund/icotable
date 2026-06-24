@@ -157,10 +157,16 @@ struct LatticeGeometry {
 
 fn lattice_geometry(n: usize) -> LatticeGeometry {
     assert!(n >= 1, "lattice frequency must be ≥ 1 (got {n}); level 0 is degenerate");
+    let n_verts = 10 * n * n + 2;
+    // Vertex ids are u16 (mesh neighbor lists are `Vec<u16>`); fail loudly rather
+    // than silently wrapping `vertices.len() as u16` past 65535 (frequency ≥ 81).
+    assert!(
+        n_verts <= 1 << 16,
+        "lattice frequency {n} yields {n_verts} vertices, exceeding the u16 id limit (65536)"
+    );
     let (faces, _) = master_faces();
     let nf = n as f64;
     let per_face = (n + 1) * (n + 2) / 2;
-    let n_verts = 10 * n * n + 2;
 
     let mut vertices: Vec<[f64; 3]> = Vec::with_capacity(n_verts);
     let mut key_to_id: HashMap<(i64, i64, i64), u16> = HashMap::with_capacity(n_verts);

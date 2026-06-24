@@ -49,8 +49,10 @@ pub struct MeshLevel {
     pub weights: Vec<f64>,
     /// Neighbor indices per vertex (BFS-reordered).
     pub neighbors: Vec<Vec<u16>>,
-    /// Which subdivision produced this mesh. Drives locator rebuild on load;
-    /// `#[serde(default)]` so pre-tag tables load as `Geodesic`.
+    /// Which subdivision produced this mesh; drives locator rebuild on load.
+    /// `#[serde(default)]` only helps self-describing formats — bincode (the
+    /// table loader) is not one, so adaptive tables saved before this field was
+    /// added must be regenerated rather than loaded.
     #[serde(default)]
     subdivision: Subdivision,
     /// Lazy direction→cell locator, rebuilt per `subdivision`.
