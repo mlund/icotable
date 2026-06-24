@@ -264,6 +264,10 @@ impl AnalyticLattice {
         let mut side = (p.dot(&f0.edge_planes[0]) < -EPS) as usize;
         side += 2 * ((p.dot(&f0.edge_planes[1]) < -EPS) as usize);
         side += 3 * ((p.dot(&f0.edge_planes[2]) < -EPS) as usize);
+        // Invariant: a point routed to this candidate group is outside f0 across
+        // at most one edge, so side ∈ {0,1,2,3} indexes the 4-entry `cand`. A
+        // violation indexes out of bounds (loud) rather than mis-locating silently.
+        debug_assert!(side <= 3, "master-face classifier: side={side} > 3");
         &self.faces[cand[side]]
     }
 

@@ -70,6 +70,16 @@ impl MeshLevel {
     /// `build_mesh` returns vertices in its own final order (geodesic BFS-reorders
     /// for cache locality; lattice keeps its `(face,i,j)` order).
     pub fn with_subdivision(subdivision: Subdivision, n_div: usize) -> Self {
+        // Vertex ids are u16 throughout (neighbor lists, locator). Validate the
+        // requested resolution up front so an over-large level fails with a clear
+        // message here rather than deep inside mesh generation. Both builders
+        // funnel every level through this constructor.
+        assert!(
+            subdivision.n_vertices(n_div) <= 1 << 16,
+            "subdivision level {n_div} ({subdivision:?}) needs {} vertices per sphere, \
+             exceeding the u16 id limit (65536); reduce the subdivision level",
+            subdivision.n_vertices(n_div)
+        );
         let MeshData {
             vertices,
             weights,
@@ -1221,6 +1231,14 @@ mod tests {
             .normalize();
             assert_eq!(lvl.locate(&dir), restored.locate(&dir));
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeding the u16 id limit")]
+    fn rejects_subdivision_level_past_u16() {
+        // Level 80 ⇒ 65612 vertices > 65536; must fail up front (before building
+        // the mesh), not silently wrap u16 ids deep in generation.
+        let _ = MeshLevel::with_subdivision(Subdivision::Geodesic, 80);
     }
 
     #[test]
