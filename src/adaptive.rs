@@ -104,6 +104,15 @@ impl MeshLevel {
         })
     }
 
+    /// The geodesic face grid, which the GPU port mirrors; `None` for the
+    /// lattice scheme.
+    pub(crate) fn face_grid(&self) -> Option<&crate::flat::FaceGrid> {
+        match self.grid() {
+            Locator::Geodesic(grid) => Some(grid),
+            Locator::Lattice(_) => None,
+        }
+    }
+
     /// Find the containing face and barycentric coordinates for a direction.
     pub fn locate(&self, dir: &Vector3) -> (Face, [f64; 3]) {
         self.grid().locate(dir)
@@ -203,7 +212,7 @@ pub struct Table6DAdaptive<T: num_traits::Float> {
     /// Number of radial bins.
     pub n_r: usize,
     /// Dihedral angle bin width (radians). Internal to the lookup machinery.
-    omega_step: f64,
+    pub(crate) omega_step: f64,
     /// Number of dihedral angle bins.
     pub n_omega: usize,
     /// Pre-built mesh levels (typically 2-4, indexed by `SlabResolution::Mesh::level`).

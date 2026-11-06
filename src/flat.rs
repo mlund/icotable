@@ -387,6 +387,35 @@ impl FaceGrid {
         (best_face, best_bary)
     }
 
+    /// Appends this grid to the GPU buffers (see [`crate::gpu`] for the
+    /// layout) and returns the level record: vertex count, grid size, then
+    /// the word offsets of cell starts, cell vertex ids, adjacency starts and
+    /// face vertex triples, and the float offset of the vertex positions.
+    pub(crate) fn pack(&self, words: &mut Vec<u32>, floats: &mut Vec<f32>) -> [u32; 7] {
+        let mut append = |values: &mut dyn Iterator<Item = u32>| {
+            let offset = words.len() as u32;
+            words.extend(values);
+            offset
+        };
+        let cells = append(&mut self.vtx_offsets.iter().copied());
+        let cell_vertices = append(&mut self.vertex_ids.iter().map(|&v| v as u32));
+        let adjacency = append(&mut self.adj_offsets.iter().copied());
+        let faces = append(&mut self.adj_faces.iter().flat_map(|f| f.face.map(|v| v as u32)));
+        let positions = floats.len() as u32;
+        floats.extend(self.vertices.iter().flatten().map(|&x| x as f32));
+        let n_vertices = self.vertices.len() as u32;
+        let grid = self.grid_size as u32;
+        [
+            n_vertices,
+            grid,
+            cells,
+            cell_vertices,
+            adjacency,
+            faces,
+            positions,
+        ]
+    }
+
     /// Find the nearest vertex to a direction.
     ///
     /// O(1) grid lookup + small candidate scan.

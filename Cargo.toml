@@ -26,6 +26,9 @@ half = { version = "2", features = ["num-traits", "serde"] }
 
 [dev-dependencies]
 approx = "0.5"
+bytemuck = "1"
+pollster = "0.4"
+wgpu = "29"
 divan = "0.1"
 rand = "0.8"
 tempfile = "3"

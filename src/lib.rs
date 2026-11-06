@@ -20,6 +20,8 @@
 pub mod adaptive;
 /// Portable, flat representations of angular tables for file I/O and fast lookup.
 pub mod flat;
+/// GPU (WGSL) port of the adaptive 6D lookup.
+pub mod gpu;
 /// Core icosphere tables and barycentric interpolation.
 pub mod ico;
 /// Scheme-independent lookup traits over the tabulated interaction tables.
@@ -37,8 +39,7 @@ mod vertex;
 
 // Public API
 pub use adaptive::{
-    Adaptive3DBuilder, AdaptiveBuilder, MeshLevel, SlabResolution, Table3DAdaptive,
-    Table6DAdaptive,
+    Adaptive3DBuilder, AdaptiveBuilder, MeshLevel, SlabResolution, Table3DAdaptive, Table6DAdaptive,
 };
 pub use flat::{PointGroup, Table3DFlat, Table6DFlat, TableMetadata, TailCorrectionTerm};
 /// Half-precision float for compact table storage.
@@ -46,9 +47,9 @@ pub use half::f16;
 pub use ico::{Face, IcoTable2D, IcoTable4D, Table6D};
 pub use mesh::AngularMesh;
 pub use orient::{inverse_orient, orient};
-pub use subdivision::Subdivision;
 pub use spherical::SphericalCoord;
 pub use subdivision::geodesic::make_icosphere_vertices;
+pub use subdivision::Subdivision;
 pub use table::PaddedTable;
 
 // Crate-internal re-exports
