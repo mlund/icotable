@@ -14,28 +14,77 @@ use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use get_size::GetSize;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::OnceLock;
+
+/// The one encoding for files and bytes alike, so they stay interchangeable.
+/// Matches the bincode 1 defaults used by tables written before this existed.
+fn bincode_options(limit: u64) -> impl bincode::Options {
+    use bincode::Options;
+    bincode::options()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(limit)
+}
+
+fn write_bincode(value: &impl Serialize, writer: impl Write) -> Result<()> {
+    use bincode::Options;
+    Ok(bincode_options(u64::MAX).serialize_into(writer, value)?)
+}
+
+fn read_bincode<T: DeserializeOwned>(reader: impl Read, limit: u64) -> Result<T> {
+    use bincode::Options;
+    Ok(bincode_options(limit).deserialize_from(reader)?)
+}
+
+/// bincode stops once the value is complete, so the decoder is drained after:
+/// gzip checks its CRC only at end of stream, and it's the sole check on data.
+fn read_gz_bincode<T: DeserializeOwned>(reader: impl Read, limit: u64) -> Result<T> {
+    let mut decoder = GzDecoder::new(reader);
+    let value = read_bincode(&mut decoder, limit)?;
+    std::io::copy(&mut decoder, &mut std::io::sink())?;
+    Ok(value)
+}
 
 /// Save a bincode-serializable value. A `.gz` suffix enables gzip compression.
 pub(crate) fn save_bincode(value: &impl Serialize, path: &Path) -> Result<()> {
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
     if path.extension().is_some_and(|ext| ext == "gz") {
-        bincode::serialize_into(GzEncoder::new(file, Compression::default()), value)?;
+        write_bincode(value, GzEncoder::new(file, Compression::default()))
     } else {
-        bincode::serialize_into(file, value)?;
+        write_bincode(value, file)
     }
-    Ok(())
 }
 
 /// Load a bincode-deserializable value. A `.gz` suffix enables gzip decompression.
+/// No size cap: files are trusted (callers' consistency checks target corruption,
+/// not hostile input), and a cap could reject large legitimate tables.
 pub(crate) fn load_bincode<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let file = std::io::BufReader::new(std::fs::File::open(path)?);
-    Ok(if path.extension().is_some_and(|ext| ext == "gz") {
-        bincode::deserialize_from(GzDecoder::new(file))?
+    if path.extension().is_some_and(|ext| ext == "gz") {
+        read_gz_bincode(file, u64::MAX)
     } else {
-        bincode::deserialize_from(file)?
-    })
+        read_bincode(file, u64::MAX)
+    }
+}
+
+/// In-memory counterpart of [`save_bincode`] with gzip, for targets without files.
+pub(crate) fn to_gz_bincode(value: &impl Serialize) -> Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    write_bincode(value, &mut encoder)?;
+    Ok(encoder.finish()?)
+}
+
+/// Caps the decoded size of untrusted in-memory input, which a small gzip
+/// stream could otherwise inflate until memory runs out (WASM has ≤ 4 GiB).
+/// Memory use can be a few times the decoded size (Vec growth, wider in-memory
+/// types), so this is set well below that limit but far above real tables.
+const MAX_DECODED_BYTES: u64 = 1 << 30;
+
+/// In-memory counterpart of [`load_bincode`] with gzip.
+pub(crate) fn from_gz_bincode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    read_gz_bincode(bytes, MAX_DECODED_BYTES)
 }
 
 /// Project a 3D point onto one of 6 cube faces, returning `(face_id, u, w)`.
@@ -719,7 +768,8 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
         for i in 0..3 {
             for j in 0..3 {
                 weights[i * 3 + j] = bary_a[i] * bary_b[j];
-                energies[i * 3 + j] = self.data[base + face_a[i] * self.n_vertices + face_b[j]].into();
+                energies[i * 3 + j] =
+                    self.data[base + face_a[i] * self.n_vertices + face_b[j]].into();
             }
         }
         boltzmann_average(&weights, &energies, beta)
@@ -736,7 +786,14 @@ impl<T: num_traits::Float> crate::lookup::TabulatedInteraction for Table6DFlat<T
 }
 
 impl<T: num_traits::Float + Into<f64>> crate::lookup::Lookup6D for Table6DFlat<T> {
-    fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3, beta: Option<f64>) -> f64 {
+    fn lookup(
+        &self,
+        r: f64,
+        omega: f64,
+        dir_a: &Vector3,
+        dir_b: &Vector3,
+        beta: Option<f64>,
+    ) -> f64 {
         match beta {
             Some(beta) => self.lookup_boltzmann(r, omega, dir_a, dir_b, beta),
             None => self.lookup(r, omega, dir_a, dir_b),
