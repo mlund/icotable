@@ -61,6 +61,12 @@ pub struct MeshLevel {
 }
 
 impl MeshLevel {
+    /// The scheme that built this mesh, so a loaded table can report how it
+    /// was scanned.
+    pub fn subdivision(&self) -> Subdivision {
+        self.subdivision
+    }
+
     /// Build a mesh level for the given subdivision count.
     pub fn new(n_div: usize) -> Self {
         Self::with_subdivision(Subdivision::default(), n_div)
@@ -1343,6 +1349,13 @@ mod tests {
             .normalize();
             assert_eq!(lvl.locate(&dir), restored.locate(&dir));
         }
+    }
+
+    #[test]
+    fn meshlevel_reports_its_subdivision() {
+        assert_eq!(MeshLevel::new(1).subdivision(), Subdivision::Geodesic);
+        let lattice = MeshLevel::with_subdivision(Subdivision::Lattice, 1);
+        assert_eq!(lattice.subdivision(), Subdivision::Lattice);
     }
 
     #[test]
