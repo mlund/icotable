@@ -111,21 +111,21 @@ pub(crate) fn build_mesh(n_div: usize) -> MeshData {
         .iter()
         .map(|nbrs| nbrs.iter().map(|&i| i as u16).collect())
         .collect();
-    let weights = weights_from_adjacency(points, &adjacency);
+    let mut weights = weights_from_adjacency(points, &adjacency);
 
     // BFS reorder for search-locator (FaceGrid) cache locality. Geodesic-specific:
     // schemes with a closed-form locator (lattice) keep their natural order instead.
     let n_vertices = vertices.len();
     let perm = crate::flat::bfs_vertex_permutation(&neighbors);
-    crate::flat::apply_vertex_permutation::<u8>(
+    // Weights ride along as per-vertex data, so they follow their vertices.
+    crate::flat::apply_vertex_permutation(
         &perm,
         &mut vertices,
         &mut neighbors,
-        &mut [],
+        &mut weights,
         n_vertices,
         1,
     );
-    let weights = perm.iter().map(|&old| weights[old]).collect();
 
     MeshData {
         vertices,
@@ -153,11 +153,8 @@ fn weights_from_adjacency(points: &[Vec3A], adjacency: &[Vec<usize>]) -> Vec<f64
             &points[*neighbors.last().unwrap()],
         );
         for j in 0..neighbors.len() - 1 {
-            area += spherical_face_area(
-                &points[i],
-                &points[neighbors[j]],
-                &points[neighbors[j + 1]],
-            );
+            area +=
+                spherical_face_area(&points[i], &points[neighbors[j]], &points[neighbors[j + 1]]);
         }
         weights.push(area / 3.0);
     }
@@ -222,5 +219,25 @@ mod tests {
         ];
         let area = spherical_face_area(&a, &b, &c);
         assert_relative_eq!(area, UNIT_SPHERE_AREA / 8.0, epsilon = 1e-6);
+    }
+
+    /// The BFS reorder must carry each vertex's weight with it (issue #1).
+    #[test]
+    fn reordered_mesh_keeps_each_vertex_weight() {
+        let mesh = build_mesh(3);
+        let points: Vec<Vec3A> = mesh
+            .vertices
+            .iter()
+            .map(|v| Vec3A::new(v[0] as f32, v[1] as f32, v[2] as f32))
+            .collect();
+        let adjacency: Vec<Vec<usize>> = mesh
+            .neighbors
+            .iter()
+            .map(|n| n.iter().map(|&i| i as usize).collect())
+            .collect();
+        let expected = weights_from_adjacency(&points, &adjacency);
+        for (w, e) in mesh.weights.iter().zip(&expected) {
+            assert_relative_eq!(*w, *e, epsilon = 1e-4);
+        }
     }
 }
