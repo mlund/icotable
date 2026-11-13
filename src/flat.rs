@@ -705,20 +705,21 @@ impl TryFrom<&Table6D> for Table6DFlat<half::f16> {
 /// Boltzmann-weighted combination of stencil energies (log-sum-exp).
 ///
 /// Returns `u_min - ln(Σ wᵢ exp(-β (eᵢ - u_min))) / β`. Shifting by the minimum
-/// energy keeps the exponentials in range; `INFINITY` is returned when every
-/// energy is infinite (fully repulsive) or the weighted sum underflows to zero.
+/// weighted energy keeps the exponentials in range: an unweighted deep well
+/// would underflow the rest. `INFINITY` when every weighted energy is
+/// infinite (fully repulsive) or the weighted sum underflows to zero.
 /// Interpolating the Boltzmann factor rather than the energy avoids the
 /// Jensen-inequality bias on convex surfaces. `weights` and `energies` index
 /// the same interpolation stencil. `beta` must be positive.
-fn boltzmann_average(weights: &[f64], energies: &[f64], beta: f64) -> f64 {
+pub(crate) fn boltzmann_average(weights: &[f64], energies: &[f64], beta: f64) -> f64 {
     debug_assert_eq!(weights.len(), energies.len());
-    let u_min = energies.iter().copied().fold(f64::INFINITY, f64::min);
+    // Unweighted terms are dropped, not multiplied by zero: exp may be ∞ there.
+    let weighted = || weights.iter().zip(energies).filter(|(&w, _)| w > 0.0);
+    let u_min = weighted().map(|(_, &e)| e).fold(f64::INFINITY, f64::min);
     if u_min.is_infinite() {
         return f64::INFINITY;
     }
-    let sum: f64 = weights
-        .iter()
-        .zip(energies)
+    let sum: f64 = weighted()
         .map(|(w, e)| w * (-beta * (e - u_min)).exp())
         .sum();
     if sum <= 0.0 {

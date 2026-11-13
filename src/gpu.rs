@@ -528,4 +528,29 @@ mod tests {
         );
         assert_eq!(results, [(2.5, false), (0.0, false)]);
     }
+
+    /// At a mesh vertex the other face vertices weigh nothing; a deep well
+    /// there must not shift the f32 exponentials into underflow.
+    #[test]
+    fn zero_weight_vertices_do_not_shift_the_minimum() {
+        let Some(gpu) = runner() else { return };
+        let mut cpu = anisotropic_table(1e-9);
+        cpu.data.fill(0.0);
+        let slab = 2 * cpu.n_omega; // r = 7
+        let SlabResolution::Mesh { level, .. } = cpu.slab_res[slab] else {
+            panic!("slab should be a mesh")
+        };
+        let lv = &cpu.levels[level as usize];
+        let a = Vector3::from(lv.vertices[0]);
+        let (face, bary) = lv.locate(&a);
+        let unweighted = bary.iter().position(|&w| w == 0.0).expect("a vertex");
+        let base = cpu.slab_offsets[slab] as usize;
+        let row = base + face[unweighted] * lv.n_vertices;
+        cpu.data[row..row + lv.n_vertices].fill(-300.0);
+        let b = Vector3::y();
+        assert_eq!(cpu.lookup_boltzmann(7.0, 0.0, &a, &b, 0.4), 0.0);
+        let table = GpuTable::new(&cpu).unwrap();
+        let results = gpu.run(&table, &[query(7.0, 0.0, a, b, 0.4)]);
+        assert_eq!(results, [(0.0, false)]);
+    }
 }

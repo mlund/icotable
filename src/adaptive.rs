@@ -502,24 +502,8 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
                 let (_, bary_a, _, bary_b, vals) =
                     self.gather_mesh_vals(slab_idx, *level, dir_a, dir_b);
 
-                // Log-sum-exp trick: shift by u_min before exp() to prevent fp overflow.
-                // Final `u_min - ln(sum)/beta` restores the correct Boltzmann-weighted energy.
-                let u_min = vals.iter().copied().fold(f64::INFINITY, f64::min);
-                if u_min.is_infinite() {
-                    return f64::INFINITY;
-                }
-
-                let mut sum = 0.0;
-                for i in 0..3 {
-                    for j in 0..3 {
-                        sum += bary_a[i] * bary_b[j] * (-beta * (vals[i * 3 + j] - u_min)).exp();
-                    }
-                }
-
-                if sum <= 0.0 {
-                    return f64::INFINITY;
-                }
-                u_min - sum.ln() / beta
+                let weights: [f64; 9] = std::array::from_fn(|k| bary_a[k / 3] * bary_b[k % 3]);
+                crate::flat::boltzmann_average(&weights, &vals, beta)
             }
         }
     }

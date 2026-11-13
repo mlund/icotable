@@ -173,25 +173,27 @@ fn icotable_mesh_value(base: u32, n_v: u32, a: u32, b: u32) -> f32 {
 }
 
 /// Boltzmann-weighted interpolation over the 3×3 face-vertex values, shifted
-/// by the minimum so the exponentials stay in range.
+/// by the minimum weighted value so the exponentials stay in range; an
+/// unweighted deep well would underflow the rest in f32.
 fn icotable_interpolate(lv: IcotableLevel, base: u32, dir_a: vec3<f32>, dir_b: vec3<f32>, beta: f32) -> IcotableValue {
     let fa = icotable_locate(lv, dir_a);
     let fb = icotable_locate(lv, dir_b);
     var vals: array<f32, 9>;
+    var weights: array<f32, 9>;
     var u_min = ICOTABLE_REPULSIVE;
     for (var i = 0u; i < 3u; i++) {
         for (var j = 0u; j < 3u; j++) {
-            let v = icotable_mesh_value(base, lv.n_vertices, fa.vertices[i], fb.vertices[j]);
-            vals[i * 3u + j] = v;
-            u_min = min(u_min, v);
+            let k = i * 3u + j;
+            vals[k] = icotable_mesh_value(base, lv.n_vertices, fa.vertices[i], fb.vertices[j]);
+            weights[k] = fa.bary[i] * fb.bary[j];
+            if weights[k] > 0.0 { u_min = min(u_min, vals[k]); }
         }
     }
     if u_min >= ICOTABLE_REPULSIVE { return icotable_repulsive(); }
     var sum = 0.0;
-    for (var i = 0u; i < 3u; i++) {
-        for (var j = 0u; j < 3u; j++) {
-            sum += fa.bary[i] * fb.bary[j] * exp(-beta * (vals[i * 3u + j] - u_min));
-        }
+    for (var k = 0u; k < 9u; k++) {
+        // Skipped, not multiplied: an unweighted well overflows exp, and 0·∞ is NaN.
+        if weights[k] > 0.0 { sum += weights[k] * exp(-beta * (vals[k] - u_min)); }
     }
     if sum <= 0.0 { return icotable_repulsive(); }
     return icotable_value(u_min - log(sum) / beta);
