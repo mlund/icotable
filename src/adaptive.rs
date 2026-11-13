@@ -15,11 +15,11 @@
 //! The repulsive classification uses `β = 1/kT` from the generation
 //! temperature, making the table temperature-dependent.
 
-use crate::flat::{load_bincode, save_bincode, TableMetadata};
+use crate::flat::{from_gz_bincode, load_bincode, save_bincode, to_gz_bincode, TableMetadata};
 use crate::ico::Face;
 use crate::subdivision::{Locator, MeshData, Subdivision};
 use crate::Vector3;
-use anyhow::Result;
+use anyhow::{anyhow, ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -61,6 +61,12 @@ pub struct MeshLevel {
 }
 
 impl MeshLevel {
+    /// The scheme that built this mesh, so a loaded table can report how it
+    /// was scanned.
+    pub fn subdivision(&self) -> Subdivision {
+        self.subdivision
+    }
+
     /// Build a mesh level for the given subdivision count.
     pub fn new(n_div: usize) -> Self {
         Self::with_subdivision(Subdivision::default(), n_div)
@@ -104,6 +110,15 @@ impl MeshLevel {
         })
     }
 
+    /// The geodesic face grid, which the GPU port mirrors; `None` for the
+    /// lattice scheme.
+    pub(crate) fn face_grid(&self) -> Option<&crate::flat::FaceGrid> {
+        match self.grid() {
+            Locator::Geodesic(grid) => Some(grid),
+            Locator::Lattice(_) => None,
+        }
+    }
+
     /// Find the containing face and barycentric coordinates for a direction.
     pub fn locate(&self, dir: &Vector3) -> (Face, [f64; 3]) {
         self.grid().locate(dir)
@@ -112,6 +127,28 @@ impl MeshLevel {
     /// Find the nearest vertex index for a direction (no triangle search).
     fn find_nearest_vertex(&self, dir: &Vector3) -> usize {
         self.grid().find_nearest_vertex(dir)
+    }
+
+    /// The mesh regenerated from `(subdivision, n_div)`, replacing the stored one.
+    ///
+    /// Lookups and the locator assume exactly the scheme's mesh, so stored
+    /// geometry and weights from an untrusted file aren't trusted. Topology must
+    /// match, since slab data is indexed by vertex order; coordinates aren't
+    /// compared because f32 trig in different libms differs by an ulp.
+    fn regenerated(&self) -> Result<Self> {
+        // Bound n_div before `n_vertices` (quadratic in n_div) can overflow,
+        // then hold the u16 vertex-id limit that `with_subdivision` asserts.
+        ensure!(self.n_div <= 255, "mesh subdivision level too large");
+        ensure!(
+            self.subdivision.n_vertices(self.n_div) <= 1 << 16,
+            "mesh exceeds the u16 vertex-id limit"
+        );
+        let expected = Self::with_subdivision(self.subdivision, self.n_div);
+        ensure!(
+            self.n_vertices == expected.n_vertices && self.neighbors == expected.neighbors,
+            "mesh topology differs from its subdivision scheme's mesh"
+        );
+        Ok(expected)
     }
 }
 
@@ -181,7 +218,7 @@ pub struct Table6DAdaptive<T: num_traits::Float> {
     /// Number of radial bins.
     pub n_r: usize,
     /// Dihedral angle bin width (radians). Internal to the lookup machinery.
-    omega_step: f64,
+    pub(crate) omega_step: f64,
     /// Number of dihedral angle bins.
     pub n_omega: usize,
     /// Pre-built mesh levels (typically 2-4, indexed by `SlabResolution::Mesh::level`).
@@ -204,8 +241,84 @@ impl<T: num_traits::Float + Serialize + serde::de::DeserializeOwned> Table6DAdap
     }
 
     /// Load from a bincode file (gzip-decompressed if path ends in `.gz`).
+    /// Checked like [`from_bytes`](Self::from_bytes) to catch corrupt files.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        load_bincode(path.as_ref())
+        load_bincode::<Self>(path.as_ref())?.checked()
+    }
+
+    /// Gzipped bincode bytes, for callers without a filesystem (e.g. WASM).
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        to_gz_bincode(self)
+    }
+
+    /// Inverse of [`to_bytes`](Self::to_bytes). Bytes may come from an untrusted
+    /// file, so the table is checked here rather than failing inside a lookup.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        from_gz_bincode::<Self>(bytes)?.checked()
+    }
+
+    /// Checks the table and replaces its meshes with regenerated ones.
+    fn checked(mut self) -> Result<Self> {
+        // Each level is regenerated, so bound how many a file can ask for.
+        const MAX_LEVELS: usize = 16;
+        ensure!(self.levels.len() <= MAX_LEVELS, "too many mesh levels");
+        self.check_grid()?;
+        self.levels = self
+            .levels
+            .iter()
+            .map(MeshLevel::regenerated)
+            .collect::<Result<_>>()?;
+        self.check_slabs()?;
+        self.validate_metadata()?;
+        Ok(self)
+    }
+
+    /// Lookups derive bin indices from these, so they must agree with the counts.
+    fn check_grid(&self) -> Result<()> {
+        let positive = |x: f64| x.is_finite() && x > 0.0;
+        ensure!(
+            self.rmin.is_finite() && self.rmax > self.rmin && positive(self.dr),
+            "invalid radial range"
+        );
+        ensure!(positive(self.omega_step), "invalid dihedral step");
+        ensure!(
+            self.n_r == ((self.rmax - self.rmin) / self.dr + 0.5) as usize,
+            "radial bin count disagrees with range"
+        );
+        ensure!(
+            self.n_omega == (std::f64::consts::TAU / self.omega_step + 0.5) as usize,
+            "dihedral bin count disagrees with step"
+        );
+        // Lookups divide by n_omega and index slab 0, so neither may be empty.
+        ensure!(self.n_r > 0 && self.n_omega > 0, "table has no bins");
+        Ok(())
+    }
+
+    /// Checked arithmetic: inputs are untrusted, and `usize` is 32-bit on WASM.
+    fn check_slabs(&self) -> Result<()> {
+        let n_slabs = self
+            .n_r
+            .checked_mul(self.n_omega)
+            .ok_or_else(|| anyhow!("table grid too large"))?;
+        ensure!(
+            self.slab_res.len() == n_slabs && self.slab_offsets.len() == n_slabs,
+            "slab count disagrees with grid"
+        );
+        for (res, &offset) in self.slab_res.iter().zip(&self.slab_offsets) {
+            if let SlabResolution::Mesh { level, .. } = res {
+                let n_v = self
+                    .levels
+                    .get(*level as usize)
+                    .ok_or_else(|| anyhow!("slab refers to missing mesh level"))?
+                    .n_vertices;
+                let end = n_v
+                    .checked_mul(n_v)
+                    .and_then(|size| size.checked_add(offset as usize));
+                let in_bounds = offset != u32::MAX && end.is_some_and(|e| e <= self.data.len());
+                ensure!(in_bounds, "slab data out of bounds");
+            }
+        }
+        Ok(())
     }
 
     /// Validate that tail correction metadata is self-consistent.
@@ -260,9 +373,7 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
                         }
                     }
                 }
-                SlabResolution::Mesh {
-                    level: lvl_idx, ..
-                } => {
+                SlabResolution::Mesh { level: lvl_idx, .. } => {
                     let slab_n_v = self.levels[*lvl_idx as usize].n_vertices;
                     let base = self.slab_offsets[slab_idx] as usize;
                     for vi in 0..slab_n_v.min(n_v) {
@@ -391,24 +502,8 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
                 let (_, bary_a, _, bary_b, vals) =
                     self.gather_mesh_vals(slab_idx, *level, dir_a, dir_b);
 
-                // Log-sum-exp trick: shift by u_min before exp() to prevent fp overflow.
-                // Final `u_min - ln(sum)/beta` restores the correct Boltzmann-weighted energy.
-                let u_min = vals.iter().copied().fold(f64::INFINITY, f64::min);
-                if u_min.is_infinite() {
-                    return f64::INFINITY;
-                }
-
-                let mut sum = 0.0;
-                for i in 0..3 {
-                    for j in 0..3 {
-                        sum += bary_a[i] * bary_b[j] * (-beta * (vals[i * 3 + j] - u_min)).exp();
-                    }
-                }
-
-                if sum <= 0.0 {
-                    return f64::INFINITY;
-                }
-                u_min - sum.ln() / beta
+                let weights: [f64; 9] = std::array::from_fn(|k| bary_a[k / 3] * bary_b[k % 3]);
+                crate::flat::boltzmann_average(&weights, &vals, beta)
             }
         }
     }
@@ -424,7 +519,14 @@ impl<T: num_traits::Float> crate::lookup::TabulatedInteraction for Table6DAdapti
 }
 
 impl<T: num_traits::Float + Into<f64>> crate::lookup::Lookup6D for Table6DAdaptive<T> {
-    fn lookup(&self, r: f64, omega: f64, dir_a: &Vector3, dir_b: &Vector3, beta: Option<f64>) -> f64 {
+    fn lookup(
+        &self,
+        r: f64,
+        omega: f64,
+        dir_a: &Vector3,
+        dir_b: &Vector3,
+        beta: Option<f64>,
+    ) -> f64 {
         match beta {
             Some(beta) => self.lookup_boltzmann(r, omega, dir_a, dir_b, beta),
             None => self.lookup(r, omega, dir_a, dir_b),
@@ -1234,6 +1336,13 @@ mod tests {
     }
 
     #[test]
+    fn meshlevel_reports_its_subdivision() {
+        assert_eq!(MeshLevel::new(1).subdivision(), Subdivision::Geodesic);
+        let lattice = MeshLevel::with_subdivision(Subdivision::Lattice, 1);
+        assert_eq!(lattice.subdivision(), Subdivision::Lattice);
+    }
+
+    #[test]
     #[should_panic(expected = "exceeding the u16 id limit")]
     fn rejects_subdivision_level_past_u16() {
         // Level 80 ⇒ 65612 vertices > 65536; must fail up front (before building
@@ -1463,6 +1572,84 @@ mod tests {
         builder.build()
     }
 
+    #[test]
+    fn bytes_round_trip_preserves_lookups() {
+        let table = make_adaptive_table_with_fn(2, |a, b| a.x + 2.0 * b.y - a.z * b.z);
+        let restored = Table6DAdaptive::<f32>::from_bytes(&table.to_bytes().unwrap()).unwrap();
+        let v = |x, y, z| Vector3::new(x, y, z).normalize();
+        let poses = [
+            (5.2, 0.3, v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0)),
+            (6.9, 2.1, v(0.3, -0.5, 0.8), v(-0.6, 0.2, 0.7)),
+            (7.6, 5.0, v(-0.2, 0.9, -0.4), v(0.5, 0.5, -0.7)),
+        ];
+        for (r, w, a, b) in poses {
+            assert_eq!(table.lookup(r, w, &a, &b), restored.lookup(r, w, &a, &b));
+        }
+    }
+
+    /// Mesh vertices come from f32 trig in the platform libm, so a table built
+    /// natively may differ by an ulp from the mesh regenerated in WASM.
+    #[test]
+    fn from_bytes_accepts_ulp_level_vertex_differences() {
+        let mut table = make_adaptive_table_with_fn(1, |a, b| a.x - b.y);
+        let dir = Vector3::new(0.3, -0.5, 0.8).normalize();
+        let expected = table.lookup(6.0, 1.0, &dir, &dir);
+        table.levels[1].vertices[5][0] += 6e-8;
+        let restored = Table6DAdaptive::<f32>::from_bytes(&table.to_bytes().unwrap()).unwrap();
+        assert_eq!(restored.lookup(6.0, 1.0, &dir, &dir), expected);
+    }
+
+    /// The gzip CRC is the only check on the data values themselves.
+    #[test]
+    fn from_bytes_rejects_a_bad_gzip_checksum() {
+        let table = make_adaptive_table_with_fn(1, |a, _| a.x);
+        let mut bytes = table.to_bytes().unwrap();
+        let crc = bytes.len() - 8; // gzip trailer: CRC32, then input size
+        bytes[crc] ^= 0xff;
+        assert!(Table6DAdaptive::<f32>::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn from_bytes_rejects_truncated_input() {
+        let table = make_adaptive_table_with_fn(1, |a, _| a.x);
+        let bytes = table.to_bytes().unwrap();
+        assert!(Table6DAdaptive::<f32>::from_bytes(&bytes[..bytes.len() / 2]).is_err());
+    }
+
+    /// Well-formed bincode can still describe a table whose lookups would
+    /// index out of bounds; that must fail at load, not at lookup.
+    #[test]
+    fn from_bytes_rejects_inconsistent_tables() {
+        let valid = make_adaptive_table_with_fn(1, |a, _| a.x);
+        // Stored geometry is replaced by the regenerated mesh, so only
+        // topology corruption is an error.
+        let corruptions: [fn(&mut Table6DAdaptive<f32>); 7] = [
+            |t| t.data.truncate(t.data.len() / 2),
+            |t| t.slab_res.truncate(t.slab_res.len() - 1),
+            |t| t.levels[0].neighbors[0][0] = u16::MAX,
+            |t| t.n_omega += 1,
+            |t| t.levels[0].neighbors[0].reverse(),
+            // A step wider than 2π gives zero dihedral bins.
+            |t| {
+                t.omega_step = 100.0;
+                t.n_omega = 0;
+                t.slab_res.clear();
+                t.slab_offsets.clear();
+            },
+            // Finite but huge range: n_r saturates and n_r * n_omega overflows.
+            |t| {
+                t.rmax = 1e300;
+                t.n_r = usize::MAX;
+            },
+        ];
+        for corrupt in corruptions {
+            let mut table = valid.clone();
+            corrupt(&mut table);
+            let bytes = table.to_bytes().unwrap();
+            assert!(Table6DAdaptive::<f32>::from_bytes(&bytes).is_err());
+        }
+    }
+
     /// Quaternion-driven lookups that land on exact icosphere vertices should
     /// return the stored value. Drives the full `orient → inverse_orient →
     /// lookup` path (as Faunus does) with an arbitrary lab-frame rotation, and
@@ -1549,10 +1736,13 @@ mod tests {
 
         // The test is only meaningful if interpolation is actually exercised.
         assert!(
-            table
-                .slab_res
-                .iter()
-                .any(|sr| matches!(sr, SlabResolution::Mesh { interpolate: true, .. })),
+            table.slab_res.iter().any(|sr| matches!(
+                sr,
+                SlabResolution::Mesh {
+                    interpolate: true,
+                    ..
+                }
+            )),
             "expected at least one interpolated mesh slab"
         );
 
