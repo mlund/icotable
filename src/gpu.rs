@@ -401,7 +401,7 @@ mod tests {
             .collect();
         let results = gpu.run(&GpuTable::new(table).unwrap(), &queries);
         for ((r, w, a, b), (energy, repulsive)) in cases.iter().zip(results) {
-            let expected = table.lookup_boltzmann(*r, *w, a, b, 0.4);
+            let expected = table.lookup_boltzmann(*r, *w, a, b, 0.4).energy;
             if expected.is_infinite() {
                 assert!(repulsive, "r={r} ω={w}: GPU {energy}, CPU repulsive");
             } else {
@@ -520,7 +520,7 @@ mod tests {
         // Small enough at β = 0.4 to stay scalar rather than repulsive.
         let cpu = constant_table(2.5);
         let (x, y) = (Vector3::x(), Vector3::y());
-        assert_eq!(cpu.lookup_boltzmann(7.0, 1.0, &x, &y, 0.4), 2.5);
+        assert_eq!(cpu.lookup_boltzmann(7.0, 1.0, &x, &y, 0.4).energy, 2.5);
         let table = GpuTable::new(&cpu).unwrap();
         let results = gpu.run(
             &table,
@@ -548,7 +548,7 @@ mod tests {
         let row = base + face[unweighted] * lv.n_vertices;
         cpu.data[row..row + lv.n_vertices].fill(-300.0);
         let b = Vector3::y();
-        assert_eq!(cpu.lookup_boltzmann(7.0, 0.0, &a, &b, 0.4), 0.0);
+        assert_eq!(cpu.lookup_boltzmann(7.0, 0.0, &a, &b, 0.4).energy, 0.0);
         let table = GpuTable::new(&cpu).unwrap();
         let results = gpu.run(&table, &[query(7.0, 0.0, a, b, 0.4)]);
         assert_eq!(results, [(0.0, false)]);

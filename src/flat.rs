@@ -6,6 +6,7 @@
 //! [`half::f16`] for half-precision storage. Vertices are BFS-reordered
 //! during construction to improve cache locality.
 
+use crate::boltzmann::{combine, Interpolated};
 use crate::ico::{Face, IcoTable2D, Table6D};
 use crate::table::PaddedTable;
 use crate::Vector3;
@@ -703,32 +704,6 @@ impl TryFrom<&Table6D> for Table6DFlat<half::f16> {
     }
 }
 
-/// Boltzmann-weighted combination of stencil energies (log-sum-exp).
-///
-/// Returns `u_min - ln(Σ wᵢ exp(-β (eᵢ - u_min))) / β`. Shifting by the minimum
-/// weighted energy keeps the exponentials in range: an unweighted deep well
-/// would underflow the rest. `INFINITY` when every weighted energy is
-/// infinite (fully repulsive) or the weighted sum underflows to zero.
-/// Interpolating the Boltzmann factor rather than the energy avoids the
-/// Jensen-inequality bias on convex surfaces. `weights` and `energies` index
-/// the same interpolation stencil. `beta` must be positive.
-pub(crate) fn boltzmann_average(weights: &[f64], energies: &[f64], beta: f64) -> f64 {
-    debug_assert_eq!(weights.len(), energies.len());
-    // Unweighted terms are dropped, not multiplied by zero: exp may be ∞ there.
-    let weighted = || weights.iter().zip(energies).filter(|(&w, _)| w > 0.0);
-    let u_min = weighted().map(|(_, &e)| e).fold(f64::INFINITY, f64::min);
-    if u_min.is_infinite() {
-        return f64::INFINITY;
-    }
-    let sum: f64 = weighted()
-        .map(|(w, e)| w * (-beta * (e - u_min)).exp())
-        .sum();
-    if sum <= 0.0 {
-        return f64::INFINITY;
-    }
-    u_min - sum.ln() / beta
-}
-
 impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
     /// Resolve R/ω bins and icosphere faces for a given query point.
     #[allow(clippy::type_complexity)]
@@ -786,24 +761,25 @@ impl<T: num_traits::Float + Into<f64>> Table6DFlat<T> {
         dir_a: &Vector3,
         dir_b: &Vector3,
         beta: f64,
-    ) -> f64 {
+    ) -> Interpolated {
         debug_assert!(beta > 0.0, "beta must be positive, got {beta}");
         let (base, face_a, bary_a, face_b, bary_b) = match self.resolve_bins(r, omega, dir_a, dir_b)
         {
             Some(v) => v,
-            None => return 0.0,
+            None => return Interpolated::exact(0.0),
         };
 
         let mut weights = [0.0f64; 9];
-        let mut energies = [0.0f64; 9];
+        let mut parts = [Interpolated::exact(0.0); 9];
         for i in 0..3 {
             for j in 0..3 {
                 weights[i * 3 + j] = bary_a[i] * bary_b[j];
-                energies[i * 3 + j] =
-                    self.data[base + face_a[i] * self.n_vertices + face_b[j]].into();
+                parts[i * 3 + j] = Interpolated::exact(
+                    self.data[base + face_a[i] * self.n_vertices + face_b[j]].into(),
+                );
             }
         }
-        boltzmann_average(&weights, &energies, beta)
+        combine(&weights, &parts, beta)
     }
 }
 
@@ -817,17 +793,17 @@ impl<T: num_traits::Float> crate::lookup::TabulatedInteraction for Table6DFlat<T
 }
 
 impl<T: num_traits::Float + Into<f64>> crate::lookup::Lookup6D for Table6DFlat<T> {
-    fn lookup(
+    fn interpolate(
         &self,
         r: f64,
         omega: f64,
         dir_a: &Vector3,
         dir_b: &Vector3,
         beta: Option<f64>,
-    ) -> f64 {
+    ) -> Interpolated {
         match beta {
             Some(beta) => self.lookup_boltzmann(r, omega, dir_a, dir_b, beta),
-            None => self.lookup(r, omega, dir_a, dir_b),
+            None => Interpolated::exact(self.lookup(r, omega, dir_a, dir_b)),
         }
     }
 }
@@ -1114,10 +1090,10 @@ impl<T: num_traits::Float + Into<f64>> Table3DFlat<T> {
     /// Interpolating `exp(-beta*u)` and inverting avoids the Jensen-inequality
     /// bias of linear interpolation on a convex energy surface (mirrors
     /// [`Table6DFlat::lookup_boltzmann`]). `beta` must be positive.
-    pub(crate) fn lookup_boltzmann(&self, r: f64, direction: &Vector3, beta: f64) -> f64 {
+    pub(crate) fn lookup_boltzmann(&self, r: f64, direction: &Vector3, beta: f64) -> Interpolated {
         debug_assert!(beta > 0.0, "beta must be positive, got {beta}");
         if r < self.rmin || r > self.rmax {
-            return 0.0;
+            return Interpolated::exact(0.0);
         }
         let ri = ((r - self.rmin) / self.dr + 0.5) as usize;
         let ri = ri.min(self.n_r.saturating_sub(1));
@@ -1128,8 +1104,8 @@ impl<T: num_traits::Float + Into<f64>> Table3DFlat<T> {
         let (face, bary) = grid.locate(direction);
         let base = ri * self.n_vertices;
 
-        let energies = face.map(|vi| self.data[base + vi].into());
-        boltzmann_average(&bary, &energies, beta)
+        let parts = face.map(|vi| Interpolated::exact(self.data[base + vi].into()));
+        combine(&bary, &parts, beta)
     }
 }
 
@@ -1140,10 +1116,10 @@ impl<T: num_traits::Float> crate::lookup::TabulatedInteraction for Table3DFlat<T
 }
 
 impl<T: num_traits::Float + Into<f64>> crate::lookup::Lookup3D for Table3DFlat<T> {
-    fn lookup(&self, r: f64, dir: &Vector3, beta: Option<f64>) -> f64 {
+    fn interpolate(&self, r: f64, dir: &Vector3, beta: Option<f64>) -> Interpolated {
         match beta {
             Some(beta) => self.lookup_boltzmann(r, dir, beta),
-            None => self.lookup(r, dir),
+            None => Interpolated::exact(self.lookup(r, dir)),
         }
     }
 }
@@ -1209,7 +1185,7 @@ mod tests {
         // Boltzmann path reachable via `Some(beta)`; accessor matches the fields.
         assert_eq!(
             Lookup6D::lookup(&table, r, 0.0, &dir, &dir, Some(1.0)),
-            table.lookup_boltzmann(r, 0.0, &dir, &dir, 1.0)
+            table.lookup_boltzmann(r, 0.0, &dir, &dir, 1.0).energy
         );
         assert_eq!(table.r_range(), (table.rmin, table.rmax));
     }
@@ -1234,9 +1210,9 @@ mod tests {
         let dir_a = Vector3::new(1.0, 0.0, 0.0);
         let dir_b = Vector3::new(0.0, 1.0, 0.0);
         // Constant table: Boltzmann lookup should also return ~42 for any beta
-        let e = table.lookup_boltzmann(7.0, 1.0, &dir_a, &dir_b, 1.0);
+        let e = table.lookup_boltzmann(7.0, 1.0, &dir_a, &dir_b, 1.0).energy;
         assert!((e - 42.0).abs() < 1e-4, "Expected ~42, got {}", e);
-        let e2 = table.lookup_boltzmann(7.0, 1.0, &dir_a, &dir_b, 0.5);
+        let e2 = table.lookup_boltzmann(7.0, 1.0, &dir_a, &dir_b, 0.5).energy;
         assert!((e2 - 42.0).abs() < 1e-4, "Expected ~42, got {}", e2);
     }
 
@@ -1250,7 +1226,7 @@ mod tests {
         let dir_a = Vector3::new(1.0, 1.0, 1.0).normalize();
         let dir_b = Vector3::new(-1.0, 0.5, 0.3).normalize();
         let linear = table.lookup(6.0, 0.0, &dir_a, &dir_b);
-        let boltz = table.lookup_boltzmann(6.0, 0.0, &dir_a, &dir_b, 1.0);
+        let boltz = table.lookup_boltzmann(6.0, 0.0, &dir_a, &dir_b, 1.0).energy;
         assert!(
             boltz <= linear + 1e-10,
             "Boltzmann ({boltz:.4}) should be <= linear ({linear:.4}) for convex function"

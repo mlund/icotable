@@ -15,6 +15,7 @@
 //! The repulsive classification uses `β = 1/kT` from the generation
 //! temperature, making the table temperature-dependent.
 
+use crate::boltzmann::{combine, Interpolated};
 use crate::flat::{from_gz_bincode, load_bincode, save_bincode, to_gz_bincode, TableMetadata};
 use crate::ico::Face;
 use crate::subdivision::{Locator, MeshData, Subdivision};
@@ -483,18 +484,18 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
         dir_a: &Vector3,
         dir_b: &Vector3,
         beta: f64,
-    ) -> f64 {
+    ) -> Interpolated {
         debug_assert!(beta > 0.0, "beta must be positive, got {beta}");
         let Some(slab_idx) = self.resolve_slab_idx(r, omega) else {
-            return 0.0;
+            return Interpolated::exact(0.0);
         };
         match &self.slab_res[slab_idx] {
-            SlabResolution::Scalar(v) => *v as f64,
-            SlabResolution::Repulsive => f64::INFINITY,
+            SlabResolution::Scalar(v) => Interpolated::exact(*v as f64),
+            SlabResolution::Repulsive => Interpolated::exact(f64::INFINITY),
             SlabResolution::Mesh {
                 level,
                 interpolate: false,
-            } => self.nearest_vertex_val(slab_idx, *level, dir_a, dir_b),
+            } => Interpolated::exact(self.nearest_vertex_val(slab_idx, *level, dir_a, dir_b)),
             SlabResolution::Mesh {
                 level,
                 interpolate: true,
@@ -503,7 +504,7 @@ impl<T: num_traits::Float + Into<f64>> Table6DAdaptive<T> {
                     self.gather_mesh_vals(slab_idx, *level, dir_a, dir_b);
 
                 let weights: [f64; 9] = std::array::from_fn(|k| bary_a[k / 3] * bary_b[k % 3]);
-                crate::flat::boltzmann_average(&weights, &vals, beta)
+                combine(&weights, &vals.map(Interpolated::exact), beta)
             }
         }
     }
@@ -519,17 +520,17 @@ impl<T: num_traits::Float> crate::lookup::TabulatedInteraction for Table6DAdapti
 }
 
 impl<T: num_traits::Float + Into<f64>> crate::lookup::Lookup6D for Table6DAdaptive<T> {
-    fn lookup(
+    fn interpolate(
         &self,
         r: f64,
         omega: f64,
         dir_a: &Vector3,
         dir_b: &Vector3,
         beta: Option<f64>,
-    ) -> f64 {
+    ) -> Interpolated {
         match beta {
             Some(beta) => self.lookup_boltzmann(r, omega, dir_a, dir_b, beta),
-            None => self.lookup(r, omega, dir_a, dir_b),
+            None => Interpolated::exact(self.lookup(r, omega, dir_a, dir_b)),
         }
     }
 }
@@ -925,34 +926,24 @@ impl<T: num_traits::Float + Into<f64>> Table3DAdaptive<T> {
     }
 
     /// Boltzmann-weighted interpolation: interpolate exp(-beta*u) then invert.
-    pub(crate) fn lookup_boltzmann(&self, r: f64, dir: &Vector3, beta: f64) -> f64 {
+    pub(crate) fn lookup_boltzmann(&self, r: f64, dir: &Vector3, beta: f64) -> Interpolated {
         debug_assert!(beta > 0.0, "beta must be positive, got {beta}");
         let Some(slab_idx) = self.resolve_slab_idx(r) else {
-            return 0.0;
+            return Interpolated::exact(0.0);
         };
         match &self.slab_res[slab_idx] {
-            SlabResolution::Scalar(v) => *v as f64,
-            SlabResolution::Repulsive => f64::INFINITY,
+            SlabResolution::Scalar(v) => Interpolated::exact(*v as f64),
+            SlabResolution::Repulsive => Interpolated::exact(f64::INFINITY),
             SlabResolution::Mesh {
                 level,
                 interpolate: false,
-            } => self.nearest_vertex_val(slab_idx, *level, dir),
+            } => Interpolated::exact(self.nearest_vertex_val(slab_idx, *level, dir)),
             SlabResolution::Mesh {
                 level,
                 interpolate: true,
             } => {
                 let (_, bary, vals) = self.gather_mesh_vals(slab_idx, *level, dir);
-                let u_min = vals[0].min(vals[1]).min(vals[2]);
-                if u_min.is_infinite() {
-                    return f64::INFINITY;
-                }
-                let sum = bary[0] * (-beta * (vals[0] - u_min)).exp()
-                    + bary[1] * (-beta * (vals[1] - u_min)).exp()
-                    + bary[2] * (-beta * (vals[2] - u_min)).exp();
-                if sum <= 0.0 {
-                    return f64::INFINITY;
-                }
-                u_min - sum.ln() / beta
+                combine(&bary, &vals.map(Interpolated::exact), beta)
             }
         }
     }
@@ -968,10 +959,10 @@ impl<T: num_traits::Float> crate::lookup::TabulatedInteraction for Table3DAdapti
 }
 
 impl<T: num_traits::Float + Into<f64>> crate::lookup::Lookup3D for Table3DAdaptive<T> {
-    fn lookup(&self, r: f64, dir: &Vector3, beta: Option<f64>) -> f64 {
+    fn interpolate(&self, r: f64, dir: &Vector3, beta: Option<f64>) -> Interpolated {
         match beta {
             Some(beta) => self.lookup_boltzmann(r, dir, beta),
-            None => self.lookup(r, dir),
+            None => Interpolated::exact(self.lookup(r, dir)),
         }
     }
 }
@@ -1517,7 +1508,7 @@ mod tests {
         let table = builder.build();
         let dir_a = Vector3::new(1.0, 0.0, 0.0);
         let dir_b = Vector3::new(0.0, 1.0, 0.0);
-        let e = table.lookup_boltzmann(7.0, 1.0, &dir_a, &dir_b, 1.0);
+        let e = table.lookup_boltzmann(7.0, 1.0, &dir_a, &dir_b, 1.0).energy;
         assert!(
             (e - 42.0).abs() < 0.1,
             "Expected ~42 for constant Boltzmann, got {e}"
@@ -2090,6 +2081,7 @@ mod tests {
         assert!(table.lookup(5.0, 0.0, &dir, &dir).is_infinite());
         assert!(table
             .lookup_boltzmann(5.0, 0.0, &dir, &dir, 1.0)
+            .energy
             .is_infinite());
         // Non-repulsive slab (R=6.0 → ri=1) → finite
         let e = table.lookup(6.0, 0.0, &dir, &dir);
@@ -2417,7 +2409,7 @@ mod tests {
         }
         let table = builder.build();
         let dir = Vector3::new(1.0, 0.0, 0.0);
-        let e = table.lookup_boltzmann(7.0, &dir, 1.0);
+        let e = table.lookup_boltzmann(7.0, &dir, 1.0).energy;
         assert!(
             (e - 42.0).abs() < 0.1,
             "Expected ~42 for constant Boltzmann, got {e}"
