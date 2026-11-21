@@ -58,7 +58,7 @@ pub trait Lookup6D: TabulatedInteraction {
     /// Averaging energies would underweight every pose where they disagree.
     ///
     /// # Panics
-    /// If `separation` isn't finite.
+    /// If `separation` isn't finite, or `beta` isn't finite and positive.
     fn pair_energy(
         &self,
         separation: &Vector3,
@@ -66,6 +66,10 @@ pub trait Lookup6D: TabulatedInteraction {
         q_b: &UnitQuaternion,
         beta: f64,
     ) -> PairEnergy {
+        assert!(
+            beta.is_finite() && beta > 0.0,
+            "beta must be finite and positive, got {beta}"
+        );
         let r = separation.norm();
         // NaN would pass both range checks and read the contact bin.
         assert!(r.is_finite(), "pair separation must be finite, got {r}");
@@ -101,9 +105,15 @@ pub trait Lookup6D: TabulatedInteraction {
             (-beta * (forward - low)).exp(),
             (-beta * (reverse - low)).exp(),
         );
+        let gap = (wf - wr).abs();
         PairEnergy {
             energy: low - (0.5 * (wf + wr)).ln() / beta,
-            order_mismatch: (-beta * low).exp() * (wf - wr).abs(),
+            // Equal deep wells would give ∞ × 0.
+            order_mismatch: if gap == 0.0 {
+                0.0
+            } else {
+                (-beta * low).exp() * gap
+            },
         }
     }
 }
@@ -114,7 +124,8 @@ pub struct PairEnergy {
     /// In the table's energy unit.
     pub energy: f64,
     /// |exp(−βu₁) − exp(−βu₂)| between the two lookup orders of an exchange
-    /// table: the interpolation error at this pose. Zero for one lookup.
+    /// table: how much they disagree at this pose. Zero for one lookup. Orders
+    /// that agree can still both be wrong, so this bounds no error.
     pub order_mismatch: f64,
 }
 
@@ -275,6 +286,89 @@ mod tests {
         let t = table(PointGroup::Exchange);
         let q = UnitQuaternion::identity();
         t.pair_energy(&Vector3::new(f64::NAN, 0.0, 6.0), &q, &q, BETA);
+    }
+
+    /// Exchange table whose energy depends only on which way the separation
+    /// points in the first body's frame: `ahead` along +z, `behind` otherwise.
+    /// With both bodies unrotated and B on +z, the two lookup orders read one each.
+    struct ByOrder {
+        ahead: f64,
+        behind: f64,
+        metadata: TableMetadata,
+    }
+
+    impl ByOrder {
+        fn new(ahead: f64, behind: f64) -> Self {
+            let metadata = TableMetadata {
+                point_group: PointGroup::Exchange,
+                ..Default::default()
+            };
+            Self {
+                ahead,
+                behind,
+                metadata,
+            }
+        }
+
+        fn at_contact(&self, beta: f64) -> PairEnergy {
+            let q = UnitQuaternion::identity();
+            self.pair_energy(&Vector3::new(0.0, 0.0, 6.0), &q, &q, beta)
+        }
+    }
+
+    impl super::TabulatedInteraction for ByOrder {
+        fn r_range(&self) -> (f64, f64) {
+            (RMIN, RMAX)
+        }
+        fn metadata(&self) -> Option<&TableMetadata> {
+            Some(&self.metadata)
+        }
+    }
+
+    impl Lookup6D for ByOrder {
+        fn lookup(&self, _: f64, _: f64, dir_a: &Vector3, _: &Vector3, _: Option<f64>) -> f64 {
+            if dir_a.z > 0.0 {
+                self.ahead
+            } else {
+                self.behind
+            }
+        }
+    }
+
+    /// Half the orders see a wall, so half the Boltzmann weight survives:
+    /// u = ln 2 / β, in either order. An energy mean would give +∞.
+    #[test]
+    fn a_wall_in_one_order_halves_the_boltzmann_factor() {
+        let beta = 2.0;
+        for t in [
+            ByOrder::new(0.0, f64::INFINITY),
+            ByOrder::new(f64::INFINITY, 0.0),
+        ] {
+            let pair = t.at_contact(beta);
+            assert_relative_eq!(pair.energy, std::f64::consts::LN_2 / beta);
+            assert_relative_eq!(pair.order_mismatch, 1.0);
+        }
+    }
+
+    #[test]
+    fn walls_in_both_orders_stay_a_wall() {
+        let pair = ByOrder::new(f64::INFINITY, f64::INFINITY).at_contact(BETA);
+        assert_eq!(pair.energy, f64::INFINITY);
+        assert_eq!(pair.order_mismatch, 0.0);
+    }
+
+    /// exp(−βu) overflows here; the shifted sum must not.
+    #[test]
+    fn equal_deep_wells_agree_without_overflow() {
+        let pair = ByOrder::new(-1000.0, -1000.0).at_contact(BETA);
+        assert_relative_eq!(pair.energy, -1000.0);
+        assert_eq!(pair.order_mismatch, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "beta")]
+    fn non_positive_beta_is_a_bug() {
+        ByOrder::new(0.0, 0.0).at_contact(0.0);
     }
 
     /// Compile-time proof that every concrete table implements the lookup traits,
