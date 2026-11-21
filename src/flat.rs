@@ -479,8 +479,9 @@ pub enum PointGroup {
     /// No exploitable symmetry (hetero-dimer or unknown).
     #[default]
     Asymmetric,
-    /// Homo-dimer exchange symmetry: E(A,B) = E(B,A).
-    /// Table has been pre-symmetrized so a single lookup suffices.
+    /// Homo-dimer exchange symmetry: E(A,B) = E(B,A). Off the grid the two
+    /// lookup orders still differ; [`crate::lookup::Lookup6D::pair_energy`]
+    /// combines them.
     Exchange,
 }
 
