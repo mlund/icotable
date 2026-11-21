@@ -18,6 +18,7 @@
 
 /// Adaptive 6D tables with per-R-slice resolution for fast generation and compact storage.
 pub mod adaptive;
+mod boltzmann;
 /// Portable, flat representations of angular tables for file I/O and fast lookup.
 pub mod flat;
 /// GPU (WGSL) port of the adaptive 6D lookup.
